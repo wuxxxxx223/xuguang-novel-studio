@@ -218,6 +218,7 @@ export async function commitContractPlan({ dataDir, libraryRoot, dashboard, cont
     checkpointId,
     projectId: dashboard.project.id,
     projectTitle: dashboard.project.title,
+    projectDirectoryName: dashboard.project.directoryName,
     chapter,
     relativePath: plan.relativePath,
     planHash: plan.planHash,
@@ -244,13 +245,20 @@ export async function commitContractPlan({ dataDir, libraryRoot, dashboard, cont
   const temp = path.join(path.dirname(target), `.${path.basename(target)}.${crypto.randomUUID()}.contract.tmp`);
   let applied = false;
   try {
-    await fs.writeFile(temp, plan.afterText, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    await writeFileDurable(temp, plan.afterText);
     const targetStat = await lstatOrNull(target);
     if (targetStat) throw new ContractWriteError(409, 'CONTRACT_SOURCE_CONFLICT', '正式契约目标已存在，已拒绝覆盖。');
-    await fs.rename(temp, target);
+    try {
+      await fs.link(temp, target);
+    } catch (error) {
+      if (error?.code === 'EEXIST') throw new ContractWriteError(409, 'CONTRACT_SOURCE_CONFLICT', '正式契约目标已存在，已拒绝覆盖。');
+      throw error;
+    }
+    await fs.unlink(temp);
+    await syncDirectory(path.dirname(target));
     applied = true;
-    manifest.status = 'committed';
-    manifest.committedAt = new Date().toISOString();
+    manifest.status = 'files_applied';
+    manifest.filesAppliedAt = new Date().toISOString();
     await writeJsonAtomic(path.join(checkpointDir, 'manifest.json'), manifest);
   } catch (error) {
     await fs.unlink(temp).catch(() => {});
@@ -261,7 +269,26 @@ export async function commitContractPlan({ dataDir, libraryRoot, dashboard, cont
     await writeJsonAtomic(path.join(checkpointDir, 'manifest.json'), manifest).catch(() => {});
     throw new ContractWriteError(error?.status || 500, error?.code || 'CONTRACT_WRITE_FAILED', `正式契约创建失败，已回滚：${error?.message || '未知错误'}`, { checkpointId });
   }
-  return { checkpointId, checkpointDir, committedAt: manifest.committedAt, relativePath: plan.relativePath, formalWritePerformed: true };
+  return {
+    checkpointId,
+    checkpointDir,
+    filesAppliedAt: manifest.filesAppliedAt,
+    relativePath: plan.relativePath,
+    formalWritePerformed: true,
+  };
+}
+
+export async function finalizeContractCheckpoint({ checkpointDir, committedAt }) {
+  const manifestFile = path.join(path.resolve(checkpointDir), 'manifest.json');
+  const manifest = JSON.parse(await fs.readFile(manifestFile, 'utf8'));
+  if (manifest.status === 'committed') return manifest;
+  if (manifest.status !== 'files_applied') {
+    throw new ContractWriteError(409, 'CONTRACT_CHECKPOINT_NOT_APPLIED', '章节契约 checkpoint 尚未完成正式文件写入。');
+  }
+  manifest.status = 'committed';
+  manifest.committedAt = new Date(committedAt || manifest.filesAppliedAt || Date.now()).toISOString();
+  await writeJsonAtomic(manifestFile, manifest);
+  return manifest;
 }
 
 function assertContractDraftReady(contractDraft) {
@@ -356,7 +383,7 @@ async function lstatOrNull(file) {
 }
 async function writeJsonAtomic(file, value) {
   const temp = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomUUID()}.tmp`);
-  await fs.writeFile(temp, JSON.stringify(value, null, 2) + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  await writeFileDurable(temp, JSON.stringify(value, null, 2) + '\n');
   try {
     const stat = await lstatOrNull(file);
     if (!stat) await fs.rename(temp, file);
@@ -366,7 +393,28 @@ async function writeJsonAtomic(file, value) {
       try { await fs.rename(temp, file); await fs.unlink(old).catch(() => {}); }
       catch (error) { await fs.rename(old, file).catch(() => {}); throw error; }
     }
+    await syncDirectory(path.dirname(file));
   } finally { await fs.unlink(temp).catch(() => {}); }
+}
+async function writeFileDurable(file, value) {
+  const handle = await fs.open(file, 'wx', 0o600);
+  try {
+    await handle.writeFile(value, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+async function syncDirectory(directory) {
+  let handle;
+  try {
+    handle = await fs.open(directory, 'r');
+    await handle.sync();
+  } catch (error) {
+    if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(error?.code)) throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
 }
 function hashText(value) { return crypto.createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex'); }
 function isPlainObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }

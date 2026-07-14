@@ -258,6 +258,7 @@ export async function commitWriteBackPlan({ dataDir, libraryRoot, dashboard, cha
   await fs.mkdir(backupDir, { recursive: true, mode: 0o700 });
   const manifest = {
     version: 1, checkpointId, projectId: dashboard.project.id, projectTitle: dashboard.project.title,
+    projectDirectoryName: dashboard.project.directoryName,
     chapter: dashboard.chapter.number, planHash: plan.planHash, status: 'prepared',
     createdAt: new Date().toISOString(), committedAt: null, rolledBackAt: null,
     files: [],
@@ -265,8 +266,14 @@ export async function commitWriteBackPlan({ dataDir, libraryRoot, dashboard, cha
   for (let index = 0; index < plan.files.length; index += 1) {
     const file = plan.files[index];
     const before = await readFormalFile(projectRoot, file.relativePath);
+    const currentHash = before.exists ? hashText(before.text) : MISSING_HASH;
+    if (currentHash !== file.beforeHash) {
+      throw new WriteBackError(409, 'FORMAL_SOURCE_CONFLICT', '正式文件在 checkpoint 创建前发生变化，已拒绝写入。', {
+        conflicts: [{ relativePath: file.relativePath, expectedHash: file.beforeHash, currentHash }],
+      });
+    }
     const snapshotName = before.exists ? `${String(index + 1).padStart(2, '0')}.bin` : null;
-    if (snapshotName) await fs.writeFile(path.join(backupDir, snapshotName), before.text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    if (snapshotName) await writeFileDurable(path.join(backupDir, snapshotName), before.text);
     manifest.files.push({
       relativePath: file.relativePath, beforeExists: before.exists, beforeHash: file.beforeHash,
       afterHash: file.afterHash, snapshot: snapshotName,
@@ -280,11 +287,18 @@ export async function commitWriteBackPlan({ dataDir, libraryRoot, dashboard, cha
     for (let index = 0; index < plan.files.length; index += 1) {
       const file = plan.files[index];
       const target = await resolveFormalTarget(projectRoot, file.relativePath);
+      const current = await readFormalFile(projectRoot, file.relativePath);
+      const currentHash = current.exists ? hashText(current.text) : MISSING_HASH;
+      if (currentHash !== file.beforeHash) {
+        throw new WriteBackError(409, 'FORMAL_SOURCE_CONFLICT', `${file.relativePath} 在正式替换前发生变化，已拒绝写入。`, {
+          conflicts: [{ relativePath: file.relativePath, expectedHash: file.beforeHash, currentHash }],
+        });
+      }
       const targetStat = await lstatOrNull(target);
       const token = crypto.randomUUID();
       const temp = path.join(path.dirname(target), `.${path.basename(target)}.${token}.writeback.tmp`);
       const old = targetStat ? path.join(path.dirname(target), `.${path.basename(target)}.${token}.writeback.old`) : null;
-      await fs.writeFile(temp, file.afterText, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      await writeFileDurable(temp, file.afterText);
       const record = { target, temp, old, existed: Boolean(targetStat), applied: false, oldMoved: false };
       staged.push(record);
       if (targetStat) {
@@ -293,11 +307,12 @@ export async function commitWriteBackPlan({ dataDir, libraryRoot, dashboard, cha
         record.oldMoved = true;
       }
       await fs.rename(temp, target);
+      await syncDirectory(path.dirname(target));
       record.applied = true;
     }
     for (const record of staged) if (record.old) await fs.unlink(record.old).catch(() => {});
-    manifest.status = 'committed';
-    manifest.committedAt = new Date().toISOString();
+    manifest.status = 'files_applied';
+    manifest.filesAppliedAt = new Date().toISOString();
     await writeJsonAtomic(path.join(checkpointDir, 'manifest.json'), manifest);
   } catch (error) {
     const rollbackErrors = [];
@@ -319,10 +334,23 @@ export async function commitWriteBackPlan({ dataDir, libraryRoot, dashboard, cha
   return {
     checkpointId,
     checkpointDir,
-    committedAt: manifest.committedAt,
+    filesAppliedAt: manifest.filesAppliedAt,
     writtenFiles: plan.files.map((file) => file.relativePath),
     formalWritePerformed: true,
   };
+}
+
+export async function finalizeWriteBackCheckpoint({ checkpointDir, committedAt }) {
+  const manifestFile = path.join(path.resolve(checkpointDir), 'manifest.json');
+  const manifest = JSON.parse(await fs.readFile(manifestFile, 'utf8'));
+  if (manifest.status === 'committed') return manifest;
+  if (manifest.status !== 'files_applied') {
+    throw new WriteBackError(409, 'WRITEBACK_CHECKPOINT_NOT_APPLIED', '正文写回 checkpoint 尚未完成正式文件写入。');
+  }
+  manifest.status = 'committed';
+  manifest.committedAt = new Date(committedAt || manifest.filesAppliedAt || Date.now()).toISOString();
+  await writeJsonAtomic(manifestFile, manifest);
+  return manifest;
 }
 
 export function assertWriteBackReady(workspace) {
@@ -395,10 +423,12 @@ async function resolveProjectRoot(libraryRoot, directoryName) {
   const root = await fs.realpath(path.resolve(libraryRoot));
   const segment = safeSegment(directoryName);
   const candidate = path.join(root, segment);
+  const candidateStat = await fs.lstat(candidate).catch(() => null);
+  if (!candidateStat || !candidateStat.isDirectory() || candidateStat.isSymbolicLink()) {
+    throw new WriteBackError(409, 'UNSAFE_PROJECT_ROOT', '小说项目根目录不是安全的普通目录。');
+  }
   const real = await fs.realpath(candidate).catch(() => null);
   if (!real || !isInside(root, real)) throw new WriteBackError(404, 'PROJECT_NOT_FOUND', '未找到可安全写入的小说项目。');
-  const stat = await fs.lstat(real);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new WriteBackError(409, 'UNSAFE_PROJECT_ROOT', '小说项目根目录不是安全的普通目录。');
   return real;
 }
 
@@ -408,10 +438,12 @@ async function resolveFormalTarget(projectRoot, relativePath) {
   const target = path.resolve(projectRoot, ...normalized.split('/'));
   if (!isInside(projectRoot, target)) throw new WriteBackError(400, 'INVALID_FORMAL_PATH', `路径越界：${relativePath}`);
   const parent = path.dirname(target);
+  const parentStat = await fs.lstat(parent).catch(() => null);
+  if (!parentStat || !parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new WriteBackError(409, 'UNSAFE_FORMAL_PARENT', `${relativePath} 的父目录不是安全的普通目录。`);
+  }
   const parentReal = await fs.realpath(parent).catch(() => null);
   if (!parentReal || !isInside(projectRoot, parentReal)) throw new WriteBackError(409, 'UNSAFE_FORMAL_PARENT', `${relativePath} 的父目录不安全。`);
-  const parentStat = await fs.lstat(parentReal);
-  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new WriteBackError(409, 'UNSAFE_FORMAL_PARENT', `${relativePath} 的父目录不是普通目录。`);
   return target;
 }
 
@@ -571,7 +603,7 @@ async function lstatOrNull(file) {
 
 async function writeJsonAtomic(file, value) {
   const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
-  await fs.writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  await writeFileDurable(temp, `${JSON.stringify(value, null, 2)}\n`);
   try {
     const stat = await lstatOrNull(file);
     if (!stat) await fs.rename(temp, file);
@@ -581,7 +613,28 @@ async function writeJsonAtomic(file, value) {
       try { await fs.rename(temp, file); await fs.unlink(old).catch(() => {}); }
       catch (error) { await fs.rename(old, file).catch(() => {}); throw error; }
     }
+    await syncDirectory(path.dirname(file));
   } finally { await fs.unlink(temp).catch(() => {}); }
+}
+async function writeFileDurable(file, value) {
+  const handle = await fs.open(file, 'wx', 0o600);
+  try {
+    await handle.writeFile(value, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+async function syncDirectory(directory) {
+  let handle;
+  try {
+    handle = await fs.open(directory, 'r');
+    await handle.sync();
+  } catch (error) {
+    if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(error?.code)) throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
 }
 
 function cleanLine(value, max = 240) { return cleanText(value, max).replace(/\s+/g, ' ').trim(); }

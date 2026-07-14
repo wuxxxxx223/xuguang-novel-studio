@@ -6,6 +6,7 @@ import {
   buildContractPlan,
   checkContractPlanSource,
   commitContractPlan,
+  finalizeContractCheckpoint,
   contractTemplate,
   normalizeContractDraft,
   validateContractText,
@@ -86,6 +87,8 @@ const receipt = await commitContractPlan({ dataDir, libraryRoot, dashboard, cont
 assert.equal(receipt.formalWritePerformed, true);
 assert.equal(await fs.readFile(target, 'utf8'), draftText, '正式契约必须逐字等于侧车草稿');
 const checkpointDir = path.join(dataDir, 'contract-checkpoints', dashboard.project.id, receipt.checkpointId);
+assert.equal(JSON.parse(await fs.readFile(path.join(checkpointDir, 'manifest.json'), 'utf8')).status, 'files_applied');
+await finalizeContractCheckpoint({ checkpointDir, committedAt: receipt.filesAppliedAt });
 const manifest = JSON.parse(await fs.readFile(path.join(checkpointDir, 'manifest.json'), 'utf8'));
 assert.equal(manifest.status, 'committed');
 assert.equal(manifest.relativePath, plan.relativePath);

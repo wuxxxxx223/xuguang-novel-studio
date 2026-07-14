@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildWriteBackPlan, checkWriteBackPlanSources, commitWriteBackPlan } from './writeback.mjs';
+import { buildWriteBackPlan, checkWriteBackPlanSources, commitWriteBackPlan, finalizeWriteBackCheckpoint } from './writeback.mjs';
 
 const serverDir = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(serverDir, '..');
@@ -116,11 +116,40 @@ const progress = JSON.parse(await fs.readFile(path.join(projectRoot, '追踪', '
 assert.equal(progress.current_chapter, 5);
 assert.deepEqual(progress.completed_chapters, [1, 2, 3, 4]);
 const checkpointDir = path.join(dataDir, 'writeback-checkpoints', dashboard.project.id, receipt.checkpointId);
+assert.equal(JSON.parse(await fs.readFile(path.join(checkpointDir, 'manifest.json'), 'utf8')).status, 'files_applied');
+await finalizeWriteBackCheckpoint({ checkpointDir, committedAt: receipt.filesAppliedAt });
 const manifest = JSON.parse(await fs.readFile(path.join(checkpointDir, 'manifest.json'), 'utf8'));
 assert.equal(manifest.status, 'committed');
 assert.equal(manifest.files.length, 10);
 const redactedPlan = JSON.parse(await fs.readFile(path.join(checkpointDir, 'plan.json'), 'utf8'));
 assert.equal(redactedPlan.files.some((file) => Object.hasOwn(file, 'beforeText') || Object.hasOwn(file, 'afterText')), false);
+
+const aliasName = '测试仙书别名';
+await fs.symlink(projectRoot, path.join(libraryRoot, aliasName), 'dir');
+await assert.rejects(
+  () => buildWriteBackPlan({
+    dataDir,
+    libraryRoot,
+    dashboard: { ...dashboard, project: { ...dashboard.project, directoryName: aliasName } },
+    chapterWorkspace,
+    sync,
+    modelMeta: { providerId: 'smoke', providerName: 'Smoke', model: 'fixture' },
+  }),
+  (error) => error?.code === 'UNSAFE_PROJECT_ROOT' && error?.status === 409,
+  '符号链接项目目录必须被拒绝',
+);
+
+const trackingRoot = path.join(projectRoot, '追踪');
+const trackingRealRoot = path.join(projectRoot, '追踪-real');
+await fs.rename(trackingRoot, trackingRealRoot);
+await fs.symlink(trackingRealRoot, trackingRoot, 'dir');
+await assert.rejects(
+  () => checkWriteBackPlanSources({ libraryRoot, dashboard, plan }),
+  (error) => error?.code === 'UNSAFE_FORMAL_PARENT' && error?.status === 409,
+  '符号链接正式文件父目录必须被拒绝',
+);
+await fs.unlink(trackingRoot);
+await fs.rename(trackingRealRoot, trackingRoot);
 
 const resolvedRun = path.resolve(runRoot);
 const resolvedTest = path.resolve(testRoot);

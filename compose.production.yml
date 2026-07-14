@@ -1,0 +1,52 @@
+name: ${COMPOSE_PROJECT_NAME:-xuguang-novel-studio}
+
+services:
+  app:
+    image: ${NOVEL_STUDIO_IMAGE:-xuguang-novel-studio:0.1.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    init: true
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "8790"
+      NOVEL_STUDIO_VERSION: ${NOVEL_STUDIO_VERSION:-0.1.0}
+      NOVEL_STUDIO_DATA_DIR: /var/lib/novel-studio
+      NOVEL_STUDIO_LIBRARY_ROOT: /library
+      NOVEL_STUDIO_LOG_FORMAT: json
+      NOVEL_STUDIO_NETWORK_BOUNDARY: loopback-published
+      NOVEL_STUDIO_TRUST_PROXY: ${NOVEL_STUDIO_TRUST_PROXY:-false}
+      NOVEL_STUDIO_TRUSTED_ORIGINS: ${NOVEL_STUDIO_TRUSTED_ORIGINS:-}
+      NOVEL_STUDIO_SHUTDOWN_TIMEOUT_MS: ${NOVEL_STUDIO_SHUTDOWN_TIMEOUT_MS:-30000}
+    ports:
+      - "127.0.0.1:${NOVEL_STUDIO_PUBLIC_PORT:-8790}:8790"
+    volumes:
+      - type: bind
+        source: ${NOVEL_STUDIO_HOST_DATA_DIR:?NOVEL_STUDIO_HOST_DATA_DIR must be set}
+        target: /var/lib/novel-studio
+      - type: bind
+        source: ${NOVEL_STUDIO_HOST_LIBRARY_ROOT:?NOVEL_STUDIO_HOST_LIBRARY_ROOT must be set}
+        target: /library
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "node", "deploy/healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"

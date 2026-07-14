@@ -15,18 +15,26 @@ import {
   normalizeGeneratedChapter, normalizeGenerationMetadata,
 } from './chapter-generation.mjs';
 import {
-  buildContractPlan, checkContractPlanSource, commitContractPlan, contractTemplate,
+  buildContractPlan, checkContractPlanSource, commitContractPlan, contractTemplate, finalizeContractCheckpoint,
   emptyContractDraft, emptyContractPlan, normalizeContractDraft, validateContractText,
 } from './contract-writeback.mjs';
 import {
   assertWriteBackReady, buildWriteBackPlan, checkWriteBackPlanSources, commitWriteBackPlan, computeReviewHash,
-  emptyWriteBackState, normalizeWriteBackState,
+  emptyWriteBackState, finalizeWriteBackCheckpoint, normalizeWriteBackState,
 } from './writeback.mjs';
+import {
+  acquireInstanceLock, assertRuntimeFilesystem, inspectRuntimeFilesystem, loadRuntimeConfig, requestOriginAllowed,
+} from './runtime-config.mjs';
+import { inspectCheckpointIntegrity } from './operational-integrity.mjs';
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(SERVER_DIR, '..');
-const DATA_DIR = path.join(PROJECT_DIR, '.data');
-const LIBRARY_ROOT = path.resolve(PROJECT_DIR, '..');
+const RUNTIME = loadRuntimeConfig({ projectDir: PROJECT_DIR });
+if (RUNTIME.production) process.umask(0o077);
+await assertRuntimeFilesystem(RUNTIME);
+const INSTANCE_LOCK = await acquireInstanceLock(RUNTIME);
+const DATA_DIR = RUNTIME.dataDir;
+const LIBRARY_ROOT = RUNTIME.libraryRoot;
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const SETTINGS_BACKUP_FILE = path.join(DATA_DIR, 'settings.previous.json');
 const WORKSPACE_FILE = path.join(DATA_DIR, 'workspace.json');
@@ -36,10 +44,11 @@ const canonRevisionStore = createCanonRevisionStore({ dataDir: DATA_DIR });
 const runLedger = createRunLedger({ dataDir: DATA_DIR });
 const benchmarkHarness = createBenchmarkHarness({ dataDir: DATA_DIR });
 const benchmarkJobManager = createBenchmarkJobManager({ benchmarkHarness });
-const DIST_DIR = path.join(PROJECT_DIR, 'dist');
+const DIST_DIR = RUNTIME.distDir;
 const SPA_INDEX_FILE = path.join(DIST_DIR, 'index.html');
-const HOST = '127.0.0.1';
-const PORT = parsePort(process.env.PORT ?? '8790');
+const HOST = RUNTIME.host;
+const PORT = RUNTIME.port;
+const APP_VERSION = String(process.env.NOVEL_STUDIO_VERSION ?? '0.1.0').trim().slice(0, 80) || '0.1.0';
 const STARTED_AT = new Date().toISOString();
 const BODY_LIMIT = '2mb';
 const SETTINGS_LIMIT = 256 * 1024;
@@ -132,13 +141,6 @@ class HttpError extends Error {
   }
 }
 
-function parsePort(raw) {
-  const port = Number(raw);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`PORT 必须是 1-65535 之间的整数，当前值为 ${JSON.stringify(raw)}。`);
-  }
-  return port;
-}
 function cloneJson(value) { return JSON.parse(JSON.stringify(value)); }
 function defaultSettings() { return cloneJson(DEFAULT_SETTINGS); }
 function defaultWorkspace() {
@@ -1255,8 +1257,12 @@ async function writeProjectChapterWorkspace(workspace) {
   const fileStat = await lstatOrNull(file);
   if (fileStat?.isSymbolicLink() || (fileStat && !fileStat.isFile())) throw new HttpError(500, 'UNSAFE_PROJECT_CHAPTER_PATH', '章节候选账本必须是普通文件。');
   assertSafeJson(workspace, { name: 'project chapter workspace', forbidCredentials: true });
+  const serialized = `${JSON.stringify(workspace, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > WORKSPACE_LIMIT) {
+    throw new HttpError(413, 'PROJECT_CHAPTER_WORKSPACE_TOO_LARGE', `章节候选账本超过 ${WORKSPACE_LIMIT} 字节限制。`);
+  }
   const temp = path.join(PROJECT_CHAPTERS_DIR, `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
-  await fs.writeFile(temp, `${JSON.stringify(workspace, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  await fs.writeFile(temp, serialized, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
   try { await fs.rename(temp, file); } finally { await fs.unlink(temp).catch(() => {}); }
 }
 function requireExpectedChapterRevision(body, workspace) {
@@ -1564,18 +1570,58 @@ async function publicRunLedgerView(projectId, run, revealCache = null) {
 function sendJson(res, status, payload) {
   res.status(status).type('application/json').send(JSON.stringify(payload));
 }
+function writeLog(level, event, fields = {}) {
+  const record = {
+    time: new Date().toISOString(),
+    level,
+    event,
+    service: 'novel-studio-next',
+    version: APP_VERSION,
+    ...fields,
+  };
+  if (RUNTIME.logFormat === 'json') {
+    const stream = level === 'error' ? process.stderr : process.stdout;
+    stream.write(`${JSON.stringify(record)}\n`);
+    return;
+  }
+  const suffix = Object.keys(fields).length ? ` ${JSON.stringify(fields)}` : '';
+  const stream = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+  stream(`[${record.time}] ${level.toUpperCase()} ${event}${suffix}`);
+}
 const app = express();
 const projectLibrary = createProjectLibrary({ libraryRoot: LIBRARY_ROOT });
+let draining = false;
 app.disable('x-powered-by');
+if (RUNTIME.trustProxy !== false) app.set('trust proxy', RUNTIME.trustProxy);
 app.use((req, res, next) => {
+  const requestStartedAt = process.hrtime.bigint();
   req.requestId = crypto.randomUUID();
   res.setHeader('x-request-id', req.requestId);
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('referrer-policy', 'no-referrer');
+  res.setHeader('x-frame-options', 'DENY');
+  res.setHeader('cross-origin-opener-policy', 'same-origin');
+  res.setHeader('cross-origin-resource-policy', 'same-origin');
+  res.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+  res.setHeader('content-security-policy', "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'");
+  if (RUNTIME.production && req.secure) res.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
   if (req.path.startsWith('/api')) res.setHeader('cache-control', 'no-store');
+  res.once('finish', () => {
+    writeLog(res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info', 'http_request', {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      durationMs: Number(process.hrtime.bigint() - requestStartedAt) / 1_000_000,
+    });
+  });
   next();
 });
 app.use('/api', (req, _res, next) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !requestOriginAllowed(req, RUNTIME)) {
+    next(new HttpError(403, 'REQUEST_ORIGIN_FORBIDDEN', '请求来源不受信任。'));
+    return;
+  }
   if (['POST', 'PUT', 'PATCH'].includes(req.method) && !req.is('application/json')) {
     next(new HttpError(415, 'JSON_CONTENT_TYPE_REQUIRED', '请求必须使用 Content-Type: application/json。'));
     return;
@@ -1584,24 +1630,53 @@ app.use('/api', (req, _res, next) => {
 });
 app.use(express.json({ limit: BODY_LIMIT, strict: true, type: 'application/json' }));
 
-app.get('/api/health', async (_req, res) => {
-  const [settingsResult, workspaceResult] = await Promise.allSettled([loadSettings(), loadWorkspace()]);
-  const settings = settingsResult.status === 'fulfilled' ? settingsResult.value : null;
-  const workspace = workspaceResult.status === 'fulfilled' ? workspaceResult.value : null;
-  sendJson(res, 200, {
-    ok: true,
+function baseHealth() {
+  return {
     service: 'novel-studio-next',
-    version: '0.1.0',
-    host: HOST,
+    version: APP_VERSION,
     time: new Date().toISOString(),
     startedAt: STARTED_AT,
     uptimeSeconds: Math.floor(process.uptime()),
+  };
+}
+async function readiness() {
+  const [filesystem, checkpointIntegrity, settingsResult, workspaceResult] = await Promise.all([
+    inspectRuntimeFilesystem(RUNTIME),
+    inspectCheckpointIntegrity(DATA_DIR),
+    loadSettings().then((value) => ({ ok: true, value }), (error) => ({ ok: false, error })),
+    loadWorkspace().then((value) => ({ ok: true, value }), (error) => ({ ok: false, error })),
+  ]);
+  const settings = settingsResult.ok ? settingsResult.value : null;
+  const workspace = workspaceResult.ok ? workspaceResult.value : null;
+  const ok = !draining && filesystem.ok && checkpointIntegrity.ok && settingsResult.ok && workspaceResult.ok;
+  return {
+    ok,
+    draining,
     modelConfigured: settings ? publicSettings(settings).configured : false,
     workspaceRevision: workspace?.revision ?? null,
     dataStatus: {
-      settings: settingsResult.status === 'fulfilled' ? 'ok' : 'error',
-      workspace: workspaceResult.status === 'fulfilled' ? 'ok' : 'error',
+      directory: filesystem.data.ok ? 'ok' : 'error',
+      settings: settingsResult.ok ? 'ok' : 'error',
+      workspace: workspaceResult.ok ? 'ok' : 'error',
     },
+    libraryStatus: filesystem.library.ok ? 'ok' : 'error',
+    buildStatus: filesystem.dist.ok ? 'ok' : 'error',
+    checkpointStatus: checkpointIntegrity.ok ? 'ok' : 'error',
+    unresolvedCheckpoints: checkpointIntegrity.unresolved,
+  };
+}
+app.get('/api/health/live', (_req, res) => {
+  sendJson(res, 200, { ok: true, ...baseHealth() });
+});
+app.get('/api/health/ready', async (_req, res) => {
+  const status = await readiness();
+  sendJson(res, status.ok ? 200 : 503, { ...status, ...baseHealth() });
+});
+app.get('/api/health', async (_req, res) => {
+  const status = await readiness();
+  sendJson(res, status.ok ? 200 : 503, {
+    ...status,
+    ...baseHealth(),
   });
 });
 
@@ -2060,11 +2135,12 @@ app.post('/api/projects/:projectId/chapter-workspace/contract-draft/commit', asy
           ...current.contractDraft.plan,
           status: 'committed',
           error: null,
-          commit: { checkpointId: receipt.checkpointId, committedAt: receipt.committedAt, formalWritePerformed: true },
+          commit: { checkpointId: receipt.checkpointId, committedAt: receipt.filesAppliedAt, formalWritePerformed: true },
         },
       },
     };
     await writeProjectChapterWorkspace(next);
+    await finalizeContractCheckpoint({ checkpointDir: receipt.checkpointDir, committedAt: receipt.filesAppliedAt });
     return next;
   });
   const nextDashboard = await projectLibrary.getDashboard(projectId);
@@ -2274,7 +2350,7 @@ app.post('/api/projects/:projectId/chapter-workspace/writeback/commit', async (r
         status: 'committed',
         error: null,
         commit: {
-          status: 'committed', checkpointId: receipt.checkpointId, committedAt: receipt.committedAt,
+          status: 'committed', checkpointId: receipt.checkpointId, committedAt: receipt.filesAppliedAt,
           writtenFiles: receipt.writtenFiles, formalWritePerformed: true,
           canonStatus: canonReceipt ? 'committed' : 'pending',
           canonRevisionId: canonReceipt?.revision?.revisionId ?? '',
@@ -2283,6 +2359,7 @@ app.post('/api/projects/:projectId/chapter-workspace/writeback/commit', async (r
       },
     };
     await writeProjectChapterWorkspace(next);
+    await finalizeWriteBackCheckpoint({ checkpointDir: receipt.checkpointDir, committedAt: receipt.filesAppliedAt });
     return next;
   });
   const nextDashboard = await projectLibrary.getDashboard(projectId);
@@ -2460,7 +2537,13 @@ app.use(express.static(DIST_DIR, {
   fallthrough: true,
   dotfiles: 'deny',
   maxAge: '1h',
-  setHeaders(res, file) { if (path.basename(file) === 'index.html') res.setHeader('cache-control', 'no-store'); },
+  setHeaders(res, file) {
+    if (path.basename(file) === 'index.html') {
+      res.setHeader('cache-control', 'no-store');
+    } else if (file.startsWith(path.join(DIST_DIR, 'assets') + path.sep)) {
+      res.setHeader('cache-control', 'public, max-age=31536000, immutable');
+    }
+  },
 }));
 app.use(async (req, res, next) => {
   if (!['GET', 'HEAD'].includes(req.method) || !req.accepts('html')) {
@@ -2486,9 +2569,14 @@ app.use((error, req, res, _next) => {
   } else if (error?.type === 'entity.too.large') {
     status = 413; code = 'REQUEST_BODY_TOO_LARGE'; message = `请求体超过 ${BODY_LIMIT} 限制。`; details = undefined;
   }
-  if (status >= 500 && !(error instanceof HttpError)) {
-    console.error(`[${req.requestId}]`, error?.stack || error);
-    message = '服务端发生内部错误。';
+  if (status >= 500) {
+    writeLog('error', 'http_error', {
+      requestId: req.requestId,
+      code,
+      errorName: String(error?.name ?? 'Error').slice(0, 120),
+      errorMessage: redactText(error?.message ?? 'unknown').slice(0, 500),
+    });
+    if (!(error instanceof HttpError)) message = '服务端发生内部错误。';
   }
   const payload = {
     ok: false,
@@ -2510,19 +2598,94 @@ async function reconcileInterruptedBenchmarkJobs() {
   const projects = await projectLibrary.listProjects();
   const results = await benchmarkJobManager.reconcileProjects(projects.map((project) => project.id));
   const staleCount = results.reduce((sum, item) => sum + item.staleCount, 0);
-  if (staleCount > 0) console.warn(`[benchmark-reconcile] 已将 ${staleCount} 个中断的 running Benchmark 标记为 stale。`);
+  if (staleCount > 0) writeLog('warn', 'benchmark_reconciled', { staleCount });
   return results;
 }
 
 const server = app.listen(PORT, HOST, () => {
-  console.log(`叙光 Novel Studio server listening at http://${HOST}:${PORT}`);
-  void reconcileInterruptedBenchmarkJobs().catch((error) => console.error('[benchmark-reconcile]', error?.stack || error));
-});
-function shutdown(signal) {
-  console.log(`Received ${signal}; shutting down.`);
-  server.close((error) => {
-    if (error) { console.error(error); process.exitCode = 1; }
+  writeLog('info', 'server_listening', {
+    host: HOST,
+    port: PORT,
+    nodeEnv: RUNTIME.nodeEnv,
+    networkBoundary: RUNTIME.networkBoundary,
   });
+  void reconcileInterruptedBenchmarkJobs().catch((error) => writeLog('error', 'benchmark_reconcile_failed', {
+    errorName: String(error?.name ?? 'Error').slice(0, 120),
+    errorMessage: redactText(error?.message ?? 'unknown').slice(0, 500),
+  }));
+});
+server.requestTimeout = 60_000;
+server.headersTimeout = 30_000;
+server.keepAliveTimeout = 5_000;
+server.maxRequestsPerSocket = 1_000;
+server.on('error', (error) => {
+  writeLog('error', 'server_error', {
+    errorName: String(error?.name ?? 'Error').slice(0, 120),
+    errorMessage: redactText(error?.message ?? 'unknown').slice(0, 500),
+  });
+  process.exitCode = 1;
+});
+
+let shutdownPromise = null;
+function shutdown(signal, requestedExitCode = 0) {
+  if (shutdownPromise) return shutdownPromise;
+  draining = true;
+  writeLog('info', 'shutdown_started', { signal, timeoutMs: RUNTIME.shutdownTimeoutMs });
+  shutdownPromise = new Promise((resolve) => {
+    let forced = false;
+    const timeout = setTimeout(() => {
+      forced = true;
+      process.exitCode = 1;
+      writeLog('error', 'shutdown_timeout', { signal, timeoutMs: RUNTIME.shutdownTimeoutMs });
+      server.closeAllConnections?.();
+    }, RUNTIME.shutdownTimeoutMs);
+    server.close(async (error) => {
+      const jobsIdle = await benchmarkJobManager.waitForIdle({
+        timeoutMs: Math.max(1_000, RUNTIME.shutdownTimeoutMs - 1_000),
+      });
+      if (!jobsIdle) {
+        forced = true;
+        process.exitCode = 1;
+        writeLog('error', 'benchmark_shutdown_timeout', {
+          signal,
+          timeoutMs: Math.max(1_000, RUNTIME.shutdownTimeoutMs - 1_000),
+        });
+      }
+      if (error) {
+        process.exitCode = 1;
+        writeLog('error', 'shutdown_failed', {
+          signal,
+          errorName: String(error?.name ?? 'Error').slice(0, 120),
+          errorMessage: redactText(error?.message ?? 'unknown').slice(0, 500),
+        });
+      } else {
+        if (requestedExitCode) process.exitCode = requestedExitCode;
+        writeLog(forced ? 'warn' : 'info', 'shutdown_completed', { signal, forced });
+      }
+      clearTimeout(timeout);
+      await INSTANCE_LOCK.release().catch((lockError) => writeLog('error', 'instance_lock_release_failed', {
+        errorName: String(lockError?.name ?? 'Error').slice(0, 120),
+        errorMessage: redactText(lockError?.message ?? 'unknown').slice(0, 500),
+      }));
+      resolve();
+    });
+    server.closeIdleConnections?.();
+  });
+  return shutdownPromise;
 }
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => { void shutdown('SIGINT'); });
+process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.once('uncaughtException', (error) => {
+  writeLog('error', 'uncaught_exception', {
+    errorName: String(error?.name ?? 'Error').slice(0, 120),
+    errorMessage: redactText(error?.message ?? 'unknown').slice(0, 500),
+  });
+  void shutdown('uncaughtException', 1);
+});
+process.once('unhandledRejection', (reason) => {
+  writeLog('error', 'unhandled_rejection', {
+    errorName: String(reason?.name ?? typeof reason).slice(0, 120),
+    errorMessage: redactText(reason?.message ?? reason ?? 'unknown').slice(0, 500),
+  });
+  void shutdown('unhandledRejection', 1);
+});

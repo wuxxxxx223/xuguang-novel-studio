@@ -2,10 +2,10 @@
 
 全新独立的 AI 小说创作工作台，不依赖旧 `workbench/` 或 `novel-compiler/studio` 前端。
 
-## 运行
+## 本地运行
 
-```powershell
-npm install
+```bash
+npm ci
 npm run build
 npm start
 ```
@@ -27,14 +27,22 @@ npm start
 - 正式提交要求再次勾选确认，先创建 `.data/writeback-checkpoints/`，再写入正文与追踪账本；源文件变化会阻塞提交。
 - 正式正文字节级来自作者已确认候选，追踪同步模型只提取摘要、角色、伏笔、时间线和下一章目标。
 
-## 验证
+## 生产部署
 
-```powershell
-npm run build
-npm run test:contract
-npm run test:writeback
-node --check server/index.mjs
-node --check server/contract-writeback.mjs
+当前生产拓扑是**单用户、单实例、文件存储**。应用端口默认仅发布到宿主机
+`127.0.0.1`；远程访问必须经过 TLS 与身份认证代理。完整部署、备份、恢复、
+升级和回滚步骤见 [`docs/production-runbook.md`](docs/production-runbook.md)。
+
+生产发布门禁：
+
+```bash
+npm ci
+npm run release:verify
 ```
 
-契约烟测只在 `.data/contract-writeback-smoke/` 下验证“模板校验、预览不落盘、外部目标冲突、checkpoint 与精确文本写入”；正文写回烟测只在 `.data/writeback-smoke/` 下验证多文件事务。两者都不会操作真实小说目录。
+契约与正文写回烟测只在 `.data/*-smoke/` 隔离目录运行，不会操作真实小说项目。
+未终态 checkpoint 会让 readiness 返回 503；上线前必须检查：
+
+```bash
+NOVEL_STUDIO_DATA_DIR=/absolute/path/to/data npm run audit:checkpoints
+```
