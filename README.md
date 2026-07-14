@@ -52,8 +52,9 @@ NOVEL_STUDIO_DATA_DIR=/absolute/path/to/data npm run audit:checkpoints
 服务启动后，可串行处理所有项目或指定项目的当前章：
 
 ```bash
+npm run batch:projects -- --operation generate --all --dry-run
 npm run batch:projects -- --operation generate --all --confirm-spend
 npm run batch:projects -- --operation review --projects <项目ID,项目ID> --confirm-spend
 ```
 
-单项目失败不会中断后续项目。脚本只生成或审查侧车候选，不会自动确认，也不会正式写回。
+`--dry-run` 只显示可处理项目和跳过原因，不调用模型。真实执行时单项目失败不会中断后续项目。脚本只生成或审查侧车候选，不会自动确认，也不会正式写回。

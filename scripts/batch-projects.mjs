@@ -8,6 +8,7 @@ function usage() {
   return `批量处理多个小说项目的当前章候选。
 
 用法:
+  npm run batch:projects -- --operation generate --all --dry-run
   npm run batch:projects -- --operation generate --all --confirm-spend
   npm run batch:projects -- --operation review --projects <项目ID,项目ID> --confirm-spend
 
@@ -15,6 +16,7 @@ function usage() {
   --operation <generate|review>  批量生成候选或批量审查
   --all                          处理发现的全部项目
   --projects <id1,id2>           只处理指定项目 ID
+  --dry-run                      只检查可处理范围，不调用模型
   --confirm-spend                确认本批次会产生模型厂商费用
   --base-url <url>               服务地址，默认 ${DEFAULT_BASE_URL}
   --help                         显示帮助
@@ -28,6 +30,7 @@ export function parseArgs(argv) {
     operation: '',
     all: false,
     projectIds: [],
+    dryRun: false,
     confirmSpend: false,
     baseUrl: DEFAULT_BASE_URL,
     help: false,
@@ -37,6 +40,7 @@ export function parseArgs(argv) {
     const arg = argv[index];
     if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--all') options.all = true;
+    else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--confirm-spend') options.confirmSpend = true;
     else if (arg === '--operation') options.operation = String(argv[++index] ?? '').trim();
     else if (arg === '--projects') {
@@ -48,7 +52,7 @@ export function parseArgs(argv) {
   if (options.help) return options;
   if (!['generate', 'review'].includes(options.operation)) throw new Error('--operation 必须是 generate 或 review。');
   if (options.all === (options.projectIds.length > 0)) throw new Error('--all 与 --projects 必须且只能选择一个。');
-  if (!options.confirmSpend) throw new Error('模型调用前必须传入 --confirm-spend。');
+  if (!options.dryRun && !options.confirmSpend) throw new Error('模型调用前必须传入 --confirm-spend，或使用 --dry-run 仅做预检。');
   try {
     options.baseUrl = new URL(options.baseUrl).toString().replace(/\/+$/, '');
   } catch {
@@ -112,10 +116,16 @@ export async function runBatch(options, {
     errorLog(`失败  ${id}：项目 ID 未找到`);
   }
 
-  log(`开始批量${options.operation === 'generate' ? '生成' : '审查'}：${projects.length} 个项目，串行执行。`);
+  log(`${options.dryRun ? '预检批量' : '开始批量'}${options.operation === 'generate' ? '生成' : '审查'}：${projects.length} 个项目${options.dryRun ? '。' : '，串行执行。'}`);
 
   for (const project of projects) {
     const label = `${project.title || project.id} (${project.id})`;
+    const listedChapter = Number(project.currentChapter);
+    if (!Number.isInteger(listedChapter) || listedChapter < 1) {
+      results.push({ id: project.id, title: project.title, status: 'skipped', message: '未建立当前章节进度' });
+      log(`跳过  ${label}：未建立当前章节进度`);
+      continue;
+    }
     try {
       const encodedId = encodeURIComponent(project.id);
       const [dashboardResponse, workspaceResponse] = await Promise.all([
@@ -128,6 +138,11 @@ export async function runBatch(options, {
       if (!classification.eligible) {
         results.push({ id: project.id, title: project.title, status: 'skipped', message: classification.reason });
         log(`跳过  ${label}：${classification.reason}`);
+        continue;
+      }
+      if (options.dryRun) {
+        results.push({ id: project.id, title: project.title, status: 'ready', message: `第 ${dashboard.chapter.number} 章可处理` });
+        log(`可处理 ${label}：第 ${dashboard.chapter.number} 章`);
         continue;
       }
 
@@ -149,11 +164,12 @@ export async function runBatch(options, {
 
   const summary = {
     total: results.length,
+    ready: results.filter((item) => item.status === 'ready').length,
     success: results.filter((item) => item.status === 'success').length,
     skipped: results.filter((item) => item.status === 'skipped').length,
     error: results.filter((item) => item.status === 'error').length,
   };
-  log(`汇总  总计 ${summary.total}，成功 ${summary.success}，跳过 ${summary.skipped}，失败 ${summary.error}`);
+  log(`汇总  总计 ${summary.total}，可处理 ${summary.ready}，成功 ${summary.success}，跳过 ${summary.skipped}，失败 ${summary.error}`);
   return { results, summary };
 }
 

@@ -14,12 +14,14 @@ assert.equal(classifyProject('review', { chapter: { contractReady: true } }, {
   review: { status: 'ready', candidateHash: 'same' },
 }).eligible, false);
 assert.throws(() => parseArgs(['--operation', 'generate', '--all']), /confirm-spend/);
+assert.equal(parseArgs(['--operation', 'generate', '--all', '--dry-run']).dryRun, true);
 
 const projects = [
-  { id: 'project-a', title: '甲' },
-  { id: 'project-b', title: '乙' },
-  { id: 'project-c', title: '丙' },
-  { id: 'project-d', title: '丁' },
+  { id: 'project-a', title: '甲', currentChapter: 7 },
+  { id: 'project-b', title: '乙', currentChapter: 7 },
+  { id: 'project-c', title: '丙', currentChapter: 7 },
+  { id: 'project-d', title: '丁', currentChapter: 7 },
+  { id: 'project-empty', title: '未建章项目', currentChapter: null },
 ];
 const workspaces = {
   'project-a': { revision: 1, candidate: { text: '', contentHash: 'empty' }, review: { status: 'empty' } },
@@ -68,16 +70,29 @@ try {
     operation: 'generate',
     all: true,
     projectIds: [],
+    dryRun: false,
     confirmSpend: true,
     baseUrl: `http://127.0.0.1:${address.port}`,
   }, {
     log: (message) => logs.push(message),
     errorLog: (message) => errors.push(message),
   });
-  assert.deepEqual(result.summary, { total: 4, success: 2, skipped: 1, error: 1 });
+  assert.deepEqual(result.summary, { total: 5, ready: 0, success: 2, skipped: 2, error: 1 });
   assert.deepEqual(postOrder, ['project-a', 'project-c', 'project-d']);
   assert.match(errors[0], /模拟模型失败/);
-  assert.match(logs.at(-1), /成功 2，跳过 1，失败 1/);
+  assert.match(logs.at(-1), /成功 2，跳过 2，失败 1/);
+
+  postOrder.length = 0;
+  const dryRun = await runBatch({
+    operation: 'generate',
+    all: true,
+    projectIds: [],
+    dryRun: true,
+    confirmSpend: false,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+  }, { log: () => {}, errorLog: () => {} });
+  assert.deepEqual(dryRun.summary, { total: 5, ready: 3, success: 0, skipped: 2, error: 0 });
+  assert.deepEqual(postOrder, []);
 } finally {
   server.close();
   await once(server, 'close');
