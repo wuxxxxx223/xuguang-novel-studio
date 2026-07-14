@@ -12,10 +12,10 @@
     "build": "vite build",
     "start": "node server/index.mjs",
     "start:production": "NODE_ENV=production node server/index.mjs",
-    "check": "npm run build && node --check server/index.mjs && node --check server/runtime-config.mjs && node --check server/operational-integrity.mjs && node --check server/project-library.mjs && node --check server/chapter-generation.mjs && node --check server/contract-writeback.mjs && node --check server/writeback.mjs && node --check server/canon-revision.mjs && node --check server/run-ledger.mjs && node --check server/benchmark-harness.mjs && node --check server/benchmark-job-manager.mjs && node --check server/benchmark-api-async.smoke.mjs && node --check deploy/healthcheck.mjs && node --check deploy/smoke.mjs",
+    "check": "npm run build && node --check server/index.mjs && node --check server/runtime-config.mjs && node --check server/operational-integrity.mjs && node --check server/project-library.mjs && node --check server/chapter-generation.mjs && node --check server/contract-writeback.mjs && node --check server/writeback.mjs && node --check server/canon-revision.mjs && node --check server/run-ledger.mjs && node --check server/benchmark-harness.mjs && node --check server/benchmark-job-manager.mjs && node --check server/benchmark-api-async.smoke.mjs && node --check deploy/healthcheck.mjs && node --check deploy/smoke.mjs && node --check scripts/batch-projects.mjs && node --check scripts/batch-projects.smoke.mjs",
     "check:production": "npm run check && npm run test:runtime && npm run test:integrity && npm audit --omit=dev",
     "check:deployment": "bash -n deploy/preflight.sh deploy/backup.sh deploy/restore.sh && node --check deploy/healthcheck.mjs && node --check deploy/smoke.mjs",
-    "test:all": "npm run test:contract && npm run test:writeback && npm run test:generation && npm run test:canon && npm run test:runs && npm run test:benchmark && npm run test:benchmark-jobs && npm run test:benchmark-api",
+    "test:all": "npm run test:contract && npm run test:writeback && npm run test:generation && npm run test:canon && npm run test:runs && npm run test:benchmark && npm run test:benchmark-jobs && npm run test:benchmark-api && npm run test:batch",
     "release:verify": "npm run check:production && npm run check:deployment && npm run test:all",
     "test:runtime": "node server/runtime-config.smoke.mjs",
     "test:integrity": "node server/operational-integrity.smoke.mjs",
@@ -27,7 +27,9 @@
     "test:runs": "node server/run-ledger.smoke.mjs",
     "test:benchmark": "node server/benchmark-harness.smoke.mjs",
     "test:benchmark-jobs": "node server/benchmark-job-manager.smoke.mjs",
-    "test:benchmark-api": "node server/benchmark-api-async.smoke.mjs"
+    "test:benchmark-api": "node server/benchmark-api-async.smoke.mjs",
+    "test:batch": "node scripts/batch-projects.smoke.mjs",
+    "batch:projects": "node scripts/batch-projects.mjs"
   },
   "dependencies": {
     "express": "^5.1.0",

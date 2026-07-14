@@ -46,3 +46,14 @@ npm run release:verify
 ```bash
 NOVEL_STUDIO_DATA_DIR=/absolute/path/to/data npm run audit:checkpoints
 ```
+
+## 多项目批处理
+
+服务启动后，可串行处理所有项目或指定项目的当前章：
+
+```bash
+npm run batch:projects -- --operation generate --all --confirm-spend
+npm run batch:projects -- --operation review --projects <项目ID,项目ID> --confirm-spend
+```
+
+单项目失败不会中断后续项目。脚本只生成或审查侧车候选，不会自动确认，也不会正式写回。
