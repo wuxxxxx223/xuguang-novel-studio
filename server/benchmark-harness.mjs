@@ -13,6 +13,8 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'stale']);
 const CANDIDATE_STATUSES = new Set(['pending', 'running', 'succeeded', 'failed']);
 const CANDIDATE_TERMINAL_STATUSES = new Set(['succeeded', 'failed']);
 const OUTPUT_RETENTION_STATUSES = new Set(['available', 'purged']);
+const RECOMMENDATION_VERSION = 'benchmark-recommendation-v1';
+const RECOMMENDATION_SNAPSHOT_STATUSES = new Set(['stored', 'derived_legacy']);
 const SCORE_DIMENSIONS = Object.freeze([
   'contractAdherence', 'causality', 'characterConsistency', 'pacing', 'payoff', 'hook', 'styleNaturalness',
 ]);
@@ -112,6 +114,30 @@ export function createBenchmarkHarness({ dataDir, clock = () => new Date(), rand
     if (!raw) return null;
     const record = validateStoredBenchmark(raw, projectId, benchmarkId);
     return options.publicView === false ? record : publicBenchmarkView(record, options);
+  }
+
+  async function getRecommendation(projectId, benchmarkId) {
+    const record = await getBenchmark(projectId, benchmarkId, { publicView: false });
+    if (!record) return null;
+    if (record.status !== 'completed') {
+      throw new BenchmarkHarnessError(409, 'BENCHMARK_RECOMMENDATION_NOT_READY', '只有已经完成盲评的 Benchmark 才能生成推荐结论。');
+    }
+    return {
+      benchmarkId: record.benchmarkId,
+      projectId: record.projectId,
+      status: record.status,
+      revision: record.revision,
+      recommendation: effectiveRecommendation(record),
+      candidates: record.candidates
+        .filter((candidate) => candidate.status === 'succeeded')
+        .map((candidate) => ({
+          candidateId: candidate.candidateId,
+          alias: candidate.alias,
+          provider: structuredClone(candidate.provider),
+          model: candidate.model,
+          metrics: structuredClone(candidate.metrics),
+        })),
+    };
   }
 
   async function listBenchmarks(projectId, { limit = 30, status, mode, publicView = true, revealIdentities = false } = {}) {
@@ -232,15 +258,20 @@ export function createBenchmarkHarness({ dataDir, clock = () => new Date(), rand
         ranking,
         overallNote: cleanText(patch.overallNote, 4000),
       };
-      return {
+      const revision = current.revision + 1;
+      const completed = {
         ...current,
         status: 'completed',
-        revision: current.revision + 1,
+        revision,
         updatedAt: now,
         completedAt: now,
         revealIdentities: true,
         evaluation,
-        events: appendEvent(current.events, { type: 'evaluation_locked', at: now, summary: `已锁定 ${scores.length} 个候选评分。` }),
+        events: appendEvent(current.events, { type: 'evaluation_locked', at: now, summary: `已锁定 ${scores.length} 个候选评分并生成推荐快照。` }),
+      };
+      return {
+        ...completed,
+        recommendation: buildRecommendation(completed, { snapshotStatus: 'stored', sourceRevision: revision }),
       };
     });
   }
@@ -322,6 +353,7 @@ export function createBenchmarkHarness({ dataDir, clock = () => new Date(), rand
     findBenchmarkByIdempotencyKey,
     createRunningBenchmarkIdempotent,
     getBenchmark,
+    getRecommendation,
     listBenchmarks,
     startBenchmark,
     attachCandidateRun,
@@ -338,6 +370,7 @@ export function publicBenchmarkView(record, { revealIdentities = false } = {}) {
   const view = structuredClone(record);
   delete view.creation;
   view.retention = effectiveOutputRetention(view.retention);
+  view.recommendation = effectiveRecommendation(view);
   view.identityRevealed = reveal;
   view.candidates = view.candidates.map((candidate) => {
     if (reveal) return candidate;
@@ -381,6 +414,7 @@ function normalizeNewBenchmark(input, { projectId, benchmarkId, createdAt, creat
     weights: normalizeWeights(input.weights),
     candidates,
     evaluation: null,
+    recommendation: null,
     staleReason: '',
     retention: defaultOutputRetention(),
     ...(creation ? { creation: normalizeCreation(creation) } : {}),
@@ -558,6 +592,85 @@ function rankCandidates(candidates, scores, weights) {
     .map((entry, index) => ({ rank: index + 1, ...entry }));
 }
 
+function effectiveRecommendation(record) {
+  if (record.status !== 'completed') return null;
+  if (isPlainObject(record.recommendation)) return structuredClone(record.recommendation);
+  return buildRecommendation(record, { snapshotStatus: 'derived_legacy', sourceRevision: null });
+}
+
+function buildRecommendation(record, { snapshotStatus, sourceRevision }) {
+  if (!RECOMMENDATION_SNAPSHOT_STATUSES.has(snapshotStatus)) {
+    throw new BenchmarkHarnessError(500, 'BENCHMARK_RECOMMENDATION_INVALID', 'Benchmark 推荐快照状态无效。');
+  }
+  if (!isPlainObject(record.evaluation) || !Array.isArray(record.evaluation.ranking) || record.evaluation.ranking.length < 1) {
+    throw new BenchmarkHarnessError(500, 'BENCHMARK_RECOMMENDATION_INVALID', 'Benchmark 缺少可生成推荐的锁定排名。');
+  }
+  const successful = record.candidates.filter((candidate) => candidate.status === 'succeeded');
+  const winner = record.evaluation.ranking[0];
+  const second = record.evaluation.ranking[1] ?? null;
+  const scoreGap = second == null ? null : round4(winner.weightedScore - second.weightedScore);
+  const basis = second == null
+    ? 'single_successful_candidate'
+    : scoreGap === 0
+      ? 'quality_score_tie_ranking_tiebreak'
+      : 'quality_score';
+  return {
+    version: RECOMMENDATION_VERSION,
+    snapshotStatus,
+    createdAt: record.evaluation.submittedAt,
+    sourceRevision,
+    decision: {
+      candidateId: winner.candidateId,
+      basis,
+      requiresManualApply: true,
+      autoApplied: false,
+    },
+    quality: {
+      winnerCandidateId: winner.candidateId,
+      winnerScore: winner.weightedScore,
+      secondCandidateId: second?.candidateId ?? null,
+      secondScore: second?.weightedScore ?? null,
+      scoreGap,
+      comparisonStrength: second == null ? 'single_success' : 'multi_candidate',
+    },
+    operations: {
+      latency: completeMetricLeader(successful, (candidate) => candidate.metrics.latencyMs, 'ms'),
+      totalTokens: completeMetricLeader(successful, (candidate) => candidate.metrics.usage.totalTokens, 'tokens'),
+      cost: completeCostLeader(successful),
+    },
+  };
+}
+
+function completeMetricLeader(candidates, readValue, unit) {
+  const values = candidates.map((candidate) => ({ candidateId: candidate.candidateId, value: readValue(candidate) }));
+  const available = values.filter((entry) => Number.isFinite(entry.value));
+  if (available.length === 0) return { coverage: 'none', leaderCandidateId: null, value: null, unit };
+  if (available.length !== values.length) return { coverage: 'partial', leaderCandidateId: null, value: null, unit };
+  const leader = available.sort((a, b) => a.value - b.value || a.candidateId.localeCompare(b.candidateId))[0];
+  return { coverage: 'complete', leaderCandidateId: leader.candidateId, value: leader.value, unit };
+}
+
+function completeCostLeader(candidates) {
+  const values = candidates.map((candidate) => ({
+    candidateId: candidate.candidateId,
+    amount: candidate.metrics.cost.amount,
+    currency: candidate.metrics.cost.currency,
+  }));
+  const available = values.filter((entry) => Number.isFinite(entry.amount) && entry.currency);
+  const empty = { leaderCandidateId: null, amount: null, currency: '' };
+  if (available.length === 0) return { coverage: 'none', ...empty };
+  if (available.length !== values.length) return { coverage: 'partial', ...empty };
+  const currencies = new Set(available.map((entry) => entry.currency));
+  if (currencies.size !== 1) return { coverage: 'mixed_currency', ...empty };
+  const leader = available.sort((a, b) => a.amount - b.amount || a.candidateId.localeCompare(b.candidateId))[0];
+  return {
+    coverage: 'complete',
+    leaderCandidateId: leader.candidateId,
+    amount: leader.amount,
+    currency: leader.currency,
+  };
+}
+
 function normalizeMetadata(value) {
   if (!isPlainObject(value)) return {};
   const output = {};
@@ -621,6 +734,15 @@ function validateStoredBenchmark(raw, projectId, benchmarkId) {
   if (raw.status === 'awaiting_scores' && (!allTerminal || successCount < 1 || raw.evaluation != null)) corrupt('awaiting_scores Benchmark 状态不一致。');
   if (raw.status === 'failed' && (!allTerminal || successCount !== 0)) corrupt('failed Benchmark 状态不一致。');
   if (raw.status === 'completed' && (!allTerminal || successCount < 1 || !isPlainObject(raw.evaluation) || raw.revealIdentities !== true)) corrupt('completed Benchmark 状态不一致。');
+  if (raw.recommendation != null) {
+    if (raw.status !== 'completed' || !isPlainObject(raw.recommendation) || raw.recommendation.snapshotStatus !== 'stored') {
+      corrupt('Benchmark 推荐快照状态无效。');
+    }
+    const sourceRevision = Number(raw.recommendation.sourceRevision);
+    if (!Number.isInteger(sourceRevision) || sourceRevision < 1 || sourceRevision > raw.revision) corrupt('Benchmark 推荐来源 revision 无效。');
+    const expectedRecommendation = buildRecommendation(raw, { snapshotStatus: 'stored', sourceRevision });
+    if (JSON.stringify(raw.recommendation) !== JSON.stringify(expectedRecommendation)) corrupt('Benchmark 推荐快照与锁定评分或运行指标不一致。');
+  }
   assertSafeRecord(raw);
   return raw;
 }
@@ -779,6 +901,7 @@ function normalizeStringArray(value, maxItems, maxLength) { if (!Array.isArray(v
 function optionalNonNegativeInteger(value) { const number = Number(value); return Number.isInteger(number) && number >= 0 ? number : null; }
 function cleanIso(value) { if (!value) return null; const date = new Date(value); return Number.isNaN(date.getTime()) ? null : date.toISOString(); }
 function compareNullableNumber(a, b) { if (a == null && b == null) return 0; if (a == null) return 1; if (b == null) return -1; return a - b; }
+function round4(value) { return Math.round(value * 10_000) / 10_000; }
 function isPlainObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function toIso(value) { const date = value instanceof Date ? value : new Date(value); if (Number.isNaN(date.getTime())) throw new TypeError('clock must return a valid date'); return date.toISOString(); }
 function compactTime(iso) { return iso.replace(/[-:.TZ]/g, '').slice(0, 14); }

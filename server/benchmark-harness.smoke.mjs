@@ -110,6 +110,7 @@ await expectCode(() => harness.purgeOutputs(projectId, benchmark.benchmarkId, {
   expectedRevision: benchmark.revision,
   purgedBy: 'author',
 }), 'BENCHMARK_OUTPUT_PURGE_NOT_READY');
+await expectCode(() => harness.getRecommendation(projectId, benchmark.benchmarkId), 'BENCHMARK_RECOMMENDATION_NOT_READY');
 
 await expectCode(() => harness.submitEvaluation(projectId, benchmark.benchmarkId, {
   expectedRevision: benchmark.revision,
@@ -126,6 +127,20 @@ assert.equal(benchmark.status, 'completed');
 assert.equal(benchmark.revealIdentities, true);
 assert.equal(benchmark.evaluation.ranking[0].candidateId, 'candidate-a');
 assert.equal(benchmark.evaluation.ranking[0].rank, 1);
+assert.equal(benchmark.recommendation.snapshotStatus, 'stored');
+assert.equal(benchmark.recommendation.sourceRevision, benchmark.revision);
+assert.equal(benchmark.recommendation.decision.candidateId, 'candidate-a');
+assert.equal(benchmark.recommendation.decision.requiresManualApply, true);
+assert.equal(benchmark.recommendation.decision.autoApplied, false);
+assert.equal(benchmark.recommendation.quality.scoreGap, 2);
+assert.equal(benchmark.recommendation.operations.latency.leaderCandidateId, 'candidate-c');
+assert.equal(benchmark.recommendation.operations.totalTokens.leaderCandidateId, 'candidate-a');
+assert.equal(benchmark.recommendation.operations.cost.coverage, 'partial');
+
+const recommendationResult = await harness.getRecommendation(projectId, benchmark.benchmarkId);
+assert.equal(recommendationResult.recommendation.decision.candidateId, 'candidate-a');
+assert.equal(recommendationResult.candidates.length, 2);
+assert.equal(recommendationResult.candidates.every((candidate) => !Object.hasOwn(candidate, 'output') && !Object.hasOwn(candidate, 'runId')), true);
 
 const revealed = await harness.getBenchmark(projectId, benchmark.benchmarkId);
 assert.equal(revealed.identityRevealed, true);
@@ -134,6 +149,7 @@ assert.equal(revealed.candidates[0].model, 'model-a');
 assert.equal(revealed.candidates[0].runId, runId('a'));
 const originalOutputHash = revealed.candidates[0].output.contentHash;
 const originalRanking = structuredClone(revealed.evaluation.ranking);
+const originalRecommendation = structuredClone(revealed.recommendation);
 await expectCode(() => harness.submitEvaluation(projectId, benchmark.benchmarkId, {
   expectedRevision: benchmark.revision,
   scores: [score('candidate-a', 5), score('candidate-c', 5)],
@@ -149,6 +165,7 @@ assert.equal(benchmark.retention.purgedBy, 'author');
 assert.equal(benchmark.candidates.filter((item) => item.status === 'succeeded').every((item) => item.output.outputText === ''), true);
 assert.equal(benchmark.candidates[0].output.contentHash, originalOutputHash);
 assert.deepEqual(benchmark.evaluation.ranking, originalRanking);
+assert.deepEqual(benchmark.recommendation, originalRecommendation);
 const purgedRevision = benchmark.revision;
 benchmark = await harness.purgeOutputs(projectId, benchmark.benchmarkId, {
   expectedRevision: benchmark.revision,
@@ -164,6 +181,16 @@ assert.equal(listed.length, 1);
 assert.equal(listed[0].status, 'completed');
 assert.equal(listed[0].identityRevealed, true);
 assert.equal(listed[0].retention.outputs, 'purged');
+assert.deepEqual(listed[0].recommendation, originalRecommendation);
+
+const completedFile = path.join(harness.root, projectId, `${benchmark.benchmarkId}.json`);
+const legacyCompletedRecord = JSON.parse(await fs.readFile(completedFile, 'utf8'));
+delete legacyCompletedRecord.recommendation;
+await fs.writeFile(completedFile, `${JSON.stringify(legacyCompletedRecord, null, 2)}\n`, 'utf8');
+const derivedRecommendation = await harness.getRecommendation(projectId, benchmark.benchmarkId);
+assert.equal(derivedRecommendation.recommendation.snapshotStatus, 'derived_legacy');
+assert.equal(derivedRecommendation.recommendation.sourceRevision, null);
+assert.equal(derivedRecommendation.recommendation.decision.candidateId, 'candidate-a');
 
 let stale = await harness.createBenchmark({ projectId, chapter: 9, mode: 'logic', baseline: { inputHash: 'b'.repeat(64) }, candidates: candidates.slice(0, 2) });
 stale = await harness.markStale(projectId, stale.benchmarkId, { expectedRevision: stale.revision, reason: 'Canon head changed' });
@@ -244,4 +271,3 @@ function score(candidateId, value, note = '') {
 async function expectCode(action, code) {
   await assert.rejects(action, (error) => error instanceof BenchmarkHarnessError && error.code === code);
 }
-

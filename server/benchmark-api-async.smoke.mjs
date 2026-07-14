@@ -178,7 +178,7 @@ try {
     const response = await fetch(`${baseUrl}${created.pollUrl}`);
     if (!response.ok) return false;
     const payload = await response.json();
-    return payload.benchmark.status === 'awaiting_scores' ? payload : false;
+    return payload.benchmark.status === 'awaiting_scores' && payload.execution.active === false ? payload : false;
   }, 10_000, 'benchmark completion');
   assert.equal(awaiting.execution.active, false);
   assert.equal(awaiting.benchmark.candidates.every((candidate) => candidate.status === 'succeeded'), true);
@@ -201,6 +201,11 @@ try {
   const earlyPurge = await earlyPurgeResponse.json();
   assert.equal(earlyPurgeResponse.status, 409);
   assert.equal(earlyPurge.error.code, 'BENCHMARK_OUTPUT_PURGE_NOT_READY');
+
+  const earlyRecommendationResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation`);
+  const earlyRecommendation = await earlyRecommendationResponse.json();
+  assert.equal(earlyRecommendationResponse.status, 409);
+  assert.equal(earlyRecommendation.error.code, 'BENCHMARK_RECOMMENDATION_NOT_READY');
 
   const runsResponse = await fetch(`${baseUrl}/api/projects/${projectId}/runs?runType=benchmark.writer`);
   const runsPayload = await runsResponse.json();
@@ -226,6 +231,20 @@ try {
   assert.equal(evaluated.benchmark.status, 'completed');
   assert.equal(evaluated.benchmark.identityRevealed, true);
   assert.equal(evaluated.benchmark.candidates.every((candidate) => candidate.provider?.id === 'mock-provider' && candidate.model && candidate.runId), true);
+  assert.equal(evaluated.benchmark.recommendation.snapshotStatus, 'stored');
+  assert.equal(evaluated.benchmark.recommendation.decision.candidateId, 'candidate-a');
+  assert.equal(evaluated.benchmark.recommendation.decision.requiresManualApply, true);
+  assert.equal(evaluated.benchmark.recommendation.decision.autoApplied, false);
+  assert.equal(evaluated.benchmark.recommendation.quality.scoreGap, 1);
+  assert.equal(evaluated.benchmark.recommendation.operations.totalTokens.leaderCandidateId, 'candidate-a');
+  assert.equal(evaluated.benchmark.recommendation.operations.cost.coverage, 'none');
+
+  const recommendationResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation`);
+  const recommendation = await recommendationResponse.json();
+  assert.equal(recommendationResponse.status, 200);
+  assert.equal(recommendation.recommendation.decision.candidateId, 'candidate-a');
+  assert.equal(recommendation.candidates.length, 2);
+  assert.equal(recommendation.candidates.every((candidate) => !Object.hasOwn(candidate, 'output') && !Object.hasOwn(candidate, 'runId')), true);
 
   const revealedRunsResponse = await fetch(`${baseUrl}/api/projects/${projectId}/runs?runType=benchmark.writer`);
   const revealedRuns = (await revealedRunsResponse.json()).runs.filter((run) => run.metadata?.benchmarkId === created.benchmark.benchmarkId);
@@ -234,6 +253,7 @@ try {
 
   const outputHashes = evaluated.benchmark.candidates.map((candidate) => candidate.output.contentHash);
   const evaluationRanking = structuredClone(evaluated.benchmark.evaluation.ranking);
+  const recommendationSnapshot = structuredClone(evaluated.benchmark.recommendation);
   const purgeResponse = await fetch(`${baseUrl}${created.pollUrl}/outputs/purge`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -252,7 +272,13 @@ try {
   assert.equal(purged.benchmark.candidates.every((candidate) => candidate.output.outputText === ''), true);
   assert.deepEqual(purged.benchmark.candidates.map((candidate) => candidate.output.contentHash), outputHashes);
   assert.deepEqual(purged.benchmark.evaluation.ranking, evaluationRanking);
+  assert.deepEqual(purged.benchmark.recommendation, recommendationSnapshot);
   assert.equal(purged.benchmark.candidates.every((candidate) => candidate.provider?.id === 'mock-provider' && candidate.model && candidate.runId), true);
+
+  const purgedRecommendationResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation`);
+  const purgedRecommendation = await purgedRecommendationResponse.json();
+  assert.equal(purgedRecommendationResponse.status, 200);
+  assert.deepEqual(purgedRecommendation.recommendation, recommendationSnapshot);
 
   const repeatedPurgeResponse = await fetch(`${baseUrl}${created.pollUrl}/outputs/purge`, {
     method: 'POST',
@@ -279,6 +305,7 @@ try {
     recoveredInterruptedBenchmark: recovered.benchmark.status,
     finalStatus: evaluated.benchmark.status,
     outputRetention: purged.benchmark.retention.outputs,
+    recommendedCandidate: recommendation.recommendation.decision.candidateId,
     candidateRuns: revealedRuns.length,
     blindBeforeScore: true,
     identitiesRevealedAfterScore: true,

@@ -1593,6 +1593,14 @@ app.get('/api/projects/:projectId/benchmarks/:benchmarkId', async (req, res) => 
   if (!benchmark) throw new HttpError(404, 'BENCHMARK_NOT_FOUND', '未找到指定 Benchmark。');
   sendJson(res, 200, { ok: true, benchmark, execution: benchmarkJobManager.describe(projectId, benchmarkId) });
 });
+app.get('/api/projects/:projectId/benchmarks/:benchmarkId/recommendation', async (req, res) => {
+  const projectId = String(req.params.projectId ?? '').trim();
+  const dashboard = await projectLibrary.getDashboard(projectId);
+  if (!dashboard) throw new HttpError(404, 'PROJECT_NOT_FOUND', '未找到指定小说项目。');
+  const result = await benchmarkHarness.getRecommendation(projectId, String(req.params.benchmarkId ?? ''));
+  if (!result) throw new HttpError(404, 'BENCHMARK_NOT_FOUND', '未找到指定 Benchmark。');
+  sendJson(res, 200, { ok: true, ...result });
+});
 app.post('/api/projects/:projectId/benchmarks/:benchmarkId/evaluation', async (req, res) => {
   assertObject(req.body, '请求体');
   const projectId = String(req.params.projectId ?? '').trim();
@@ -2310,6 +2318,5 @@ function shutdown(signal) {
 }
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
-
 
 
