@@ -46,6 +46,7 @@ const SETTINGS_LIMIT = 256 * 1024;
 const WORKSPACE_LIMIT = 2 * 1024 * 1024;
 const UPSTREAM_LIMIT = 4 * 1024 * 1024;
 const API_KEY_MASK = '********';
+const MAX_ROUTE_APPLICATIONS = 100;
 
 const ROLES = Object.freeze(['idea', 'logic', 'blueprint', 'writer', 'review']);
 const ROLE_SET = new Set(ROLES);
@@ -65,6 +66,8 @@ const ROLE_DEFAULTS = Object.freeze({
 const DEFAULT_PROVIDER_ID = 'provider-default';
 const DEFAULT_SETTINGS = Object.freeze({
   version: 2,
+  revision: 0,
+  routeApplications: Object.freeze([]),
   providers: Object.freeze([
     Object.freeze({
       id: DEFAULT_PROVIDER_ID,
@@ -284,6 +287,70 @@ function normalizeRoleNumbers(input, existing, field, min, max) {
 function isMaskedCredential(value) {
   return typeof value === 'string' && (value.trim() === API_KEY_MASK || /^[*•●·]{4,}$/.test(value.trim()));
 }
+function normalizeSettingsRevision(value) {
+  const revision = value == null ? 0 : Number(value);
+  if (!Number.isInteger(revision) || revision < 0) {
+    throw new HttpError(400, 'INVALID_MODEL_SETTINGS', 'settings.revision 必须是非负整数。');
+  }
+  return revision;
+}
+function normalizeAuditRoute(value, field) {
+  if (!isPlainObject(value)) throw new HttpError(400, 'INVALID_MODEL_SETTINGS', `${field} 必须是对象。`);
+  const providerId = String(value.providerId ?? '').trim();
+  const model = String(value.model ?? '').trim();
+  if ((providerId && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(providerId)) || model.length > 200) {
+    throw new HttpError(400, 'INVALID_MODEL_SETTINGS', `${field} 包含无效模型路由。`);
+  }
+  return { providerId, model };
+}
+function normalizeRouteApplication(value, index) {
+  if (!isPlainObject(value)) throw new HttpError(400, 'INVALID_MODEL_SETTINGS', `routeApplications[${index}] 必须是对象。`);
+  const applicationId = String(value.applicationId ?? '').trim();
+  const projectId = String(value.projectId ?? '').trim();
+  const benchmarkId = String(value.benchmarkId ?? '').trim();
+  const candidateId = String(value.candidateId ?? '').trim();
+  const role = String(value.role ?? '').trim();
+  const recommendationFingerprint = String(value.recommendationFingerprint ?? '').trim().toLowerCase();
+  const benchmarkRevision = Number(value.benchmarkRevision);
+  const settingsRevision = Number(value.settingsRevision);
+  const appliedDate = new Date(value.appliedAt);
+  if (!/^routeapply_[a-f0-9]{32}$/.test(applicationId)
+    || !projectId || projectId.length > 200
+    || !/^bench_[A-Za-z0-9_-]{1,120}$/.test(benchmarkId)
+    || !/^candidate-[a-z0-9_-]{1,40}$/.test(candidateId)
+    || !['logic', 'writer'].includes(role)
+    || !/^[a-f0-9]{64}$/.test(recommendationFingerprint)
+    || !Number.isInteger(benchmarkRevision) || benchmarkRevision < 1
+    || !Number.isInteger(settingsRevision) || settingsRevision < 1
+    || Number.isNaN(appliedDate.getTime())) {
+    throw new HttpError(400, 'INVALID_MODEL_SETTINGS', `routeApplications[${index}] 结构无效。`);
+  }
+  const previousRoute = normalizeAuditRoute(value.previousRoute, `routeApplications[${index}].previousRoute`);
+  const appliedRoute = normalizeAuditRoute(value.appliedRoute, `routeApplications[${index}].appliedRoute`);
+  if (!appliedRoute.providerId || !appliedRoute.model) {
+    throw new HttpError(400, 'INVALID_MODEL_SETTINGS', `routeApplications[${index}].appliedRoute 不能为空。`);
+  }
+  return {
+    applicationId,
+    appliedAt: appliedDate.toISOString(),
+    projectId,
+    benchmarkId,
+    benchmarkRevision,
+    recommendationFingerprint,
+    candidateId,
+    role,
+    previousRoute,
+    appliedRoute,
+    settingsRevision,
+  };
+}
+function normalizeRouteApplications(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.length > MAX_ROUTE_APPLICATIONS) {
+    throw new HttpError(400, 'INVALID_MODEL_SETTINGS', `routeApplications 必须是最多 ${MAX_ROUTE_APPLICATIONS} 条记录的数组。`);
+  }
+  return value.map(normalizeRouteApplication);
+}
 function coerceExistingSettings(existing) {
   const base = defaultSettings();
   if (Array.isArray(existing?.providers) && isPlainObject(existing?.routes)) {
@@ -428,6 +495,8 @@ function materializeSettings(input, existing = defaultSettings()) {
   if (typeof jsonMode !== 'boolean') throw new HttpError(400, 'INVALID_MODEL_SETTINGS', 'jsonMode 必须是布尔值。');
   return {
     version: 2,
+    revision: normalizeSettingsRevision(previous.revision),
+    routeApplications: normalizeRouteApplications(previous.routeApplications),
     providers,
     routes,
     temperature: normalizeRoleNumbers(source.temperature, previous.temperature, 'temperature', 0, 2),
@@ -438,7 +507,12 @@ function materializeSettings(input, existing = defaultSettings()) {
 }
 async function loadSettings() {
   const raw = await readJsonFile(SETTINGS_FILE, defaultSettings(), SETTINGS_LIMIT);
-  try { return materializeSettings(raw, defaultSettings()); }
+  try {
+    const base = defaultSettings();
+    base.revision = normalizeSettingsRevision(raw.revision);
+    base.routeApplications = normalizeRouteApplications(raw.routeApplications);
+    return materializeSettings(raw, base);
+  }
   catch (error) {
     if (error instanceof HttpError) throw new HttpError(500, 'SETTINGS_FILE_INVALID', 'settings.json 的模型配置无效。');
     throw error;
@@ -473,6 +547,8 @@ function publicSettings(settings) {
   const firstProvider = providers[0] ?? null;
   return {
     version: 2,
+    revision: settings.revision,
+    routeApplications: cloneJson(settings.routeApplications),
     providers,
     routes,
     temperature: cloneJson(settings.temperature),
@@ -995,6 +1071,49 @@ function normalizeBenchmarkCandidateRequests(input) {
     seen.add(key);
     return { providerId, model };
   });
+}
+function normalizeRecommendationApplyRole(value) {
+  const role = String(value ?? '').trim();
+  if (!['logic', 'writer'].includes(role)) {
+    throw new HttpError(400, 'BENCHMARK_RECOMMENDATION_ROLE_REQUIRED', 'role 必须是 logic 或 writer。');
+  }
+  return role;
+}
+async function buildRecommendationRoutePreview({ projectId, benchmarkId, role, settings }) {
+  const result = await benchmarkHarness.getRecommendation(projectId, benchmarkId);
+  if (!result) throw new HttpError(404, 'BENCHMARK_NOT_FOUND', '未找到指定 Benchmark。');
+  const expectedRole = result.mode === 'writer' ? 'writer' : result.mode === 'logic' ? 'logic' : '';
+  if (!expectedRole || role !== expectedRole) {
+    throw new HttpError(409, 'BENCHMARK_RECOMMENDATION_ROLE_MISMATCH', `该 Benchmark 只能应用到 ${expectedRole || '对应'} 角色。`);
+  }
+  const candidateId = result.recommendation?.decision?.candidateId;
+  const candidate = result.candidates.find((item) => item.candidateId === candidateId);
+  if (!candidate || !candidate.provider?.id || !candidate.model) {
+    throw new HttpError(500, 'BENCHMARK_RECOMMENDATION_CANDIDATE_INVALID', '推荐候选缺少可应用的 provider/model 身份。');
+  }
+  const provider = settings.providers.find((item) => item.id === candidate.provider.id);
+  if (!provider) {
+    throw new HttpError(409, 'BENCHMARK_RECOMMENDATION_PROVIDER_NOT_FOUND', '推荐候选的模型厂商已不在当前设置中，请先恢复厂商配置。');
+  }
+  if (!provider.baseUrl || !provider.apiKey) {
+    throw new HttpError(409, 'BENCHMARK_RECOMMENDATION_PROVIDER_INCOMPLETE', `请先补全“${provider.name}”的 Base URL 与 API Key。`);
+  }
+  const current = roleRoute(settings, role);
+  const currentRoute = { providerId: current.providerId, model: current.model };
+  const proposedRoute = { providerId: provider.id, model: candidate.model };
+  return {
+    benchmarkId: result.benchmarkId,
+    benchmarkRevision: result.revision,
+    recommendationFingerprint: chapterContentHash(JSON.stringify(result.recommendation)),
+    role,
+    candidateId,
+    settingsRevision: settings.revision,
+    currentRoute,
+    proposedRoute,
+    changed: currentRoute.providerId !== proposedRoute.providerId || currentRoute.model !== proposedRoute.model,
+    requiresConfirmation: true,
+    autoApplied: false,
+  };
 }
 function benchmarkIdempotencyKey(req) {
   const key = String(req.get('idempotency-key') ?? '').trim();
@@ -1601,6 +1720,92 @@ app.get('/api/projects/:projectId/benchmarks/:benchmarkId/recommendation', async
   if (!result) throw new HttpError(404, 'BENCHMARK_NOT_FOUND', '未找到指定 Benchmark。');
   sendJson(res, 200, { ok: true, ...result });
 });
+app.post('/api/projects/:projectId/benchmarks/:benchmarkId/recommendation/apply-preview', async (req, res) => {
+  assertObject(req.body, '请求体');
+  const projectId = String(req.params.projectId ?? '').trim();
+  const dashboard = await projectLibrary.getDashboard(projectId);
+  if (!dashboard) throw new HttpError(404, 'PROJECT_NOT_FOUND', '未找到指定小说项目。');
+  const settings = await loadSettings();
+  const preview = await buildRecommendationRoutePreview({
+    projectId,
+    benchmarkId: String(req.params.benchmarkId ?? ''),
+    role: normalizeRecommendationApplyRole(req.body.role),
+    settings,
+  });
+  sendJson(res, 200, { ok: true, preview });
+});
+app.post('/api/projects/:projectId/benchmarks/:benchmarkId/recommendation/apply', async (req, res) => {
+  assertObject(req.body, '请求体');
+  if (req.body.confirmApply !== true) {
+    throw new HttpError(400, 'BENCHMARK_RECOMMENDATION_APPLY_CONFIRMATION_REQUIRED', '应用推荐模型前必须明确确认。');
+  }
+  const projectId = String(req.params.projectId ?? '').trim();
+  const dashboard = await projectLibrary.getDashboard(projectId);
+  if (!dashboard) throw new HttpError(404, 'PROJECT_NOT_FOUND', '未找到指定小说项目。');
+  const benchmarkId = String(req.params.benchmarkId ?? '');
+  const role = normalizeRecommendationApplyRole(req.body.role);
+  const candidateId = String(req.body.candidateId ?? '').trim();
+  const expectedSettingsRevision = Number(req.body.expectedSettingsRevision);
+  const recommendationFingerprint = String(req.body.recommendationFingerprint ?? '').trim().toLowerCase();
+  if (!/^candidate-[a-z0-9_-]{1,40}$/.test(candidateId)) {
+    throw new HttpError(400, 'BENCHMARK_RECOMMENDATION_CANDIDATE_REQUIRED', '必须确认推荐候选 candidateId。');
+  }
+  if (!Number.isInteger(expectedSettingsRevision) || expectedSettingsRevision < 0) {
+    throw new HttpError(400, 'EXPECTED_SETTINGS_REVISION_REQUIRED', '必须提供预览时的非负整数 expectedSettingsRevision。');
+  }
+  if (!/^[a-f0-9]{64}$/.test(recommendationFingerprint)) {
+    throw new HttpError(400, 'BENCHMARK_RECOMMENDATION_FINGERPRINT_REQUIRED', '必须提供预览返回的 recommendationFingerprint。');
+  }
+  const outcome = await queueSettingsWrite(async () => {
+    const existing = await loadSettings();
+    if (existing.revision !== expectedSettingsRevision) {
+      throw new HttpError(409, 'SETTINGS_REVISION_CONFLICT', '模型设置在预览后已经变化，请重新预览后再确认。', {
+        expectedRevision: expectedSettingsRevision,
+        actualRevision: existing.revision,
+      });
+    }
+    const preview = await buildRecommendationRoutePreview({ projectId, benchmarkId, role, settings: existing });
+    if (preview.candidateId !== candidateId) {
+      throw new HttpError(409, 'BENCHMARK_RECOMMENDATION_CANDIDATE_CHANGED', '推荐候选与确认内容不一致，请重新预览。');
+    }
+    if (preview.recommendationFingerprint !== recommendationFingerprint) {
+      throw new HttpError(409, 'BENCHMARK_RECOMMENDATION_CHANGED', 'Benchmark 推荐内容已变化，请重新预览。');
+    }
+    if (!preview.changed) {
+      return { applied: false, noChange: true, preview, application: null, settings: existing };
+    }
+    const settingsRevision = existing.revision + 1;
+    const application = {
+      applicationId: `routeapply_${crypto.randomUUID().replaceAll('-', '')}`,
+      appliedAt: new Date().toISOString(),
+      projectId,
+      benchmarkId,
+      benchmarkRevision: preview.benchmarkRevision,
+      recommendationFingerprint,
+      candidateId,
+      role,
+      previousRoute: preview.currentRoute,
+      appliedRoute: preview.proposedRoute,
+      settingsRevision,
+    };
+    const next = {
+      ...materializeSettings({ routes: { [role]: preview.proposedRoute } }, existing),
+      revision: settingsRevision,
+      routeApplications: [...existing.routeApplications, application].slice(-MAX_ROUTE_APPLICATIONS),
+    };
+    await writeJsonAtomic(SETTINGS_BACKUP_FILE, existing);
+    await writeJsonAtomic(SETTINGS_FILE, next);
+    return { applied: true, noChange: false, preview, application, settings: next };
+  });
+  sendJson(res, 200, {
+    ok: true,
+    applied: outcome.applied,
+    noChange: outcome.noChange,
+    preview: outcome.preview,
+    application: outcome.application,
+    settings: publicSettings(outcome.settings),
+  });
+});
 app.post('/api/projects/:projectId/benchmarks/:benchmarkId/evaluation', async (req, res) => {
   assertObject(req.body, '请求体');
   const projectId = String(req.params.projectId ?? '').trim();
@@ -2138,7 +2343,10 @@ app.put('/api/settings', async (req, res) => {
   const input = hasOwn(req.body, 'settings') ? req.body.settings : req.body;
   const settings = await queueSettingsWrite(async () => {
     const existing = await loadSettings();
-    const next = materializeSettings(input, existing);
+    const next = {
+      ...materializeSettings(input, existing),
+      revision: existing.revision + 1,
+    };
     await writeJsonAtomic(SETTINGS_BACKUP_FILE, existing);
     await writeJsonAtomic(SETTINGS_FILE, next);
     return next;
@@ -2318,5 +2526,3 @@ function shutdown(signal) {
 }
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
-
-

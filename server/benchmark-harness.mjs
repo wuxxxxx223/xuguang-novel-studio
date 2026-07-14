@@ -125,6 +125,7 @@ export function createBenchmarkHarness({ dataDir, clock = () => new Date(), rand
     return {
       benchmarkId: record.benchmarkId,
       projectId: record.projectId,
+      mode: record.mode,
       status: record.status,
       revision: record.revision,
       recommendation: effectiveRecommendation(record),

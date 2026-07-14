@@ -138,6 +138,7 @@ assert.equal(benchmark.recommendation.operations.totalTokens.leaderCandidateId, 
 assert.equal(benchmark.recommendation.operations.cost.coverage, 'partial');
 
 const recommendationResult = await harness.getRecommendation(projectId, benchmark.benchmarkId);
+assert.equal(recommendationResult.mode, 'writer');
 assert.equal(recommendationResult.recommendation.decision.candidateId, 'candidate-a');
 assert.equal(recommendationResult.candidates.length, 2);
 assert.equal(recommendationResult.candidates.every((candidate) => !Object.hasOwn(candidate, 'output') && !Object.hasOwn(candidate, 'runId')), true);

@@ -64,7 +64,7 @@ try {
   const settings = {
     version: 2,
     providers: [{ id: 'mock-provider', name: 'Mock Provider', type: 'openai-compatible', kind: 'relay', baseUrl: `http://127.0.0.1:${mockPort}/v1`, apiKey: 'test-key-123456' }],
-    routes: Object.fromEntries(roleNames.map((role) => [role, { providerId: 'mock-provider', model: 'model-a' }])),
+    routes: Object.fromEntries(roleNames.map((role) => [role, { providerId: 'mock-provider', model: role === 'writer' ? 'model-old' : 'model-a' }])),
     temperature: Object.fromEntries(roleNames.map((role) => [role, 0.2])),
     maxTokens: Object.fromEntries(roleNames.map((role) => [role, 2000])),
     timeoutMs: 10_000,
@@ -242,9 +242,118 @@ try {
   const recommendationResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation`);
   const recommendation = await recommendationResponse.json();
   assert.equal(recommendationResponse.status, 200);
+  assert.equal(recommendation.mode, 'writer');
   assert.equal(recommendation.recommendation.decision.candidateId, 'candidate-a');
   assert.equal(recommendation.candidates.length, 2);
   assert.equal(recommendation.candidates.every((candidate) => !Object.hasOwn(candidate, 'output') && !Object.hasOwn(candidate, 'runId')), true);
+
+  const wrongRolePreviewResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation/apply-preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ role: 'logic' }),
+  });
+  const wrongRolePreview = await wrongRolePreviewResponse.json();
+  assert.equal(wrongRolePreviewResponse.status, 409);
+  assert.equal(wrongRolePreview.error.code, 'BENCHMARK_RECOMMENDATION_ROLE_MISMATCH');
+
+  const previewResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation/apply-preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ role: 'writer' }),
+  });
+  const previewPayload = await previewResponse.json();
+  assert.equal(previewResponse.status, 200);
+  assert.equal(previewPayload.preview.candidateId, 'candidate-a');
+  assert.equal(previewPayload.preview.settingsRevision, 0);
+  assert.deepEqual(previewPayload.preview.currentRoute, { providerId: 'mock-provider', model: 'model-old' });
+  assert.deepEqual(previewPayload.preview.proposedRoute, { providerId: 'mock-provider', model: 'model-a' });
+  assert.equal(previewPayload.preview.changed, true);
+  assert.equal(previewPayload.preview.requiresConfirmation, true);
+  assert.equal(previewPayload.preview.autoApplied, false);
+
+  const applyBody = {
+    role: 'writer',
+    candidateId: previewPayload.preview.candidateId,
+    expectedSettingsRevision: previewPayload.preview.settingsRevision,
+    recommendationFingerprint: previewPayload.preview.recommendationFingerprint,
+  };
+  const unconfirmedApplyResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation/apply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(applyBody),
+  });
+  const unconfirmedApply = await unconfirmedApplyResponse.json();
+  assert.equal(unconfirmedApplyResponse.status, 400);
+  assert.equal(unconfirmedApply.error.code, 'BENCHMARK_RECOMMENDATION_APPLY_CONFIRMATION_REQUIRED');
+
+  const mismatchedCandidateResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation/apply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...applyBody, candidateId: 'candidate-b', confirmApply: true }),
+  });
+  const mismatchedCandidate = await mismatchedCandidateResponse.json();
+  assert.equal(mismatchedCandidateResponse.status, 409);
+  assert.equal(mismatchedCandidate.error.code, 'BENCHMARK_RECOMMENDATION_CANDIDATE_CHANGED');
+
+  const applyResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation/apply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...applyBody, confirmApply: true }),
+  });
+  const applied = await applyResponse.json();
+  assert.equal(applyResponse.status, 200);
+  assert.equal(applied.applied, true);
+  assert.equal(applied.noChange, false);
+  assert.equal(applied.settings.revision, 1);
+  assert.deepEqual(applied.settings.routes.writer, { providerId: 'mock-provider', model: 'model-a' });
+  assert.equal(applied.settings.routeApplications.length, 1);
+  assert.equal(applied.application.candidateId, 'candidate-a');
+  assert.equal(applied.application.settingsRevision, 1);
+  assert.equal(JSON.stringify(applied.application).includes('test-key-123456'), false);
+  const persistedSettings = JSON.parse(await fs.readFile(path.join(dataDir, 'settings.json'), 'utf8'));
+  const previousSettings = JSON.parse(await fs.readFile(path.join(dataDir, 'settings.previous.json'), 'utf8'));
+  assert.equal(persistedSettings.revision, 1);
+  assert.deepEqual(persistedSettings.routes.writer, { providerId: 'mock-provider', model: 'model-a' });
+  assert.equal(persistedSettings.routeApplications.length, 1);
+  assert.equal(previousSettings.revision, 0);
+  assert.deepEqual(previousSettings.routes.writer, { providerId: 'mock-provider', model: 'model-old' });
+  assert.equal(previousSettings.routeApplications.length, 0);
+
+  const staleApplyResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation/apply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...applyBody, confirmApply: true }),
+  });
+  const staleApply = await staleApplyResponse.json();
+  assert.equal(staleApplyResponse.status, 409);
+  assert.equal(staleApply.error.code, 'SETTINGS_REVISION_CONFLICT');
+
+  const noChangePreviewResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation/apply-preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ role: 'writer' }),
+  });
+  const noChangePreview = await noChangePreviewResponse.json();
+  assert.equal(noChangePreviewResponse.status, 200);
+  assert.equal(noChangePreview.preview.changed, false);
+  assert.equal(noChangePreview.preview.settingsRevision, 1);
+  const noChangeApplyResponse = await fetch(`${baseUrl}${created.pollUrl}/recommendation/apply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      role: 'writer',
+      candidateId: noChangePreview.preview.candidateId,
+      expectedSettingsRevision: noChangePreview.preview.settingsRevision,
+      recommendationFingerprint: noChangePreview.preview.recommendationFingerprint,
+      confirmApply: true,
+    }),
+  });
+  const noChangeApply = await noChangeApplyResponse.json();
+  assert.equal(noChangeApplyResponse.status, 200);
+  assert.equal(noChangeApply.applied, false);
+  assert.equal(noChangeApply.noChange, true);
+  assert.equal(noChangeApply.settings.revision, 1);
+  assert.equal(noChangeApply.settings.routeApplications.length, 1);
 
   const revealedRunsResponse = await fetch(`${baseUrl}/api/projects/${projectId}/runs?runType=benchmark.writer`);
   const revealedRuns = (await revealedRunsResponse.json()).runs.filter((run) => run.metadata?.benchmarkId === created.benchmark.benchmarkId);
@@ -306,6 +415,7 @@ try {
     finalStatus: evaluated.benchmark.status,
     outputRetention: purged.benchmark.retention.outputs,
     recommendedCandidate: recommendation.recommendation.decision.candidateId,
+    routeApplicationRevision: applied.settings.revision,
     candidateRuns: revealedRuns.length,
     blindBeforeScore: true,
     identitiesRevealedAfterScore: true,
