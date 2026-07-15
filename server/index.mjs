@@ -26,6 +26,7 @@ import {
   acquireInstanceLock, assertRuntimeFilesystem, inspectRuntimeFilesystem, loadRuntimeConfig, requestOriginAllowed,
 } from './runtime-config.mjs';
 import { inspectCheckpointIntegrity } from './operational-integrity.mjs';
+import { extractConfirmedContract } from './workspace-contract.mjs';
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(SERVER_DIR, '..');
@@ -919,36 +920,6 @@ async function settleRunsForCanon({ projectId, runIds, canonRevisionId }) {
   }
   return warnings;
 }
-function extractConfirmedContract(workspace, requestedChapterId) {
-  const blueprint = workspace.stages?.blueprint;
-  if (blueprint?.status !== 'ready' || !isPlainObject(blueprint.confirmed)) return null;
-  const confirmed = blueprint.confirmed;
-  const selected = confirmed.selectedChapter;
-  const candidates = [
-    confirmed.selectedChapterContract,
-    confirmed.selectedChapterContractCandidate,
-    confirmed.nextChapterContract,
-    confirmed.nextChapterContractCandidate,
-    confirmed.chapterContract,
-    confirmed.contract,
-    isPlainObject(selected) ? selected.contract || selected : null,
-  ];
-  let contract = candidates.find((item) => (isPlainObject(item) && Object.keys(item).length) || (typeof item === 'string' && item.trim()));
-  if (!contract) {
-    const collection = Array.isArray(confirmed.chapterContracts) ? confirmed.chapterContracts : Array.isArray(confirmed.chapters) ? confirmed.chapters : [];
-    const selectedId = requestedChapterId || confirmed.selectedChapterId || (typeof selected === 'string' ? selected : undefined);
-    if (selectedId) contract = collection.find((item) => isPlainObject(item) && String(item.id ?? item.chapterId ?? item.number) === String(selectedId));
-    else if (collection.length === 1) [contract] = collection;
-  }
-  if (!contract) return null;
-  if (isPlainObject(contract)) {
-    if (contract.confirmed === false) return null;
-    if (contract.status && !['ready', 'confirmed'].includes(contract.status)) return null;
-    const id = contract.id ?? contract.chapterId ?? contract.number;
-    if (requestedChapterId && id !== undefined && String(id) !== String(requestedChapterId)) return null;
-  }
-  return cloneJson(contract);
-}
 function parseModelJson(content) {
   const raw = String(content ?? '').trim();
   if (!raw) return null;
@@ -1023,7 +994,11 @@ function buildAiPayload(role, body, persistedWorkspace) {
     const contract = extractConfirmedContract(persistedWorkspace, body.chapterId);
     if (!contract) {
       throw new HttpError(409, 'WRITER_CONTRACT_REQUIRED', 'writer 只能在已保存 Workspace 中存在已确认章节契约时运行。', {
-        requiredPath: 'stages.blueprint.confirmed.selectedChapter',
+        requiredPaths: [
+          'stages.blueprint.confirmed.selectedChapterContract',
+          'stages.blueprint.confirmed.nextChapterContractCandidate',
+          'stages.blueprint.confirmed.chapterContract',
+        ],
         requiredBlueprintStatus: 'ready',
       });
     }
