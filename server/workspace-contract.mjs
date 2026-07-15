@@ -13,31 +13,49 @@ function hasContractValue(value) {
     || (typeof value === 'string' && value.trim().length > 0);
 }
 
-export function extractConfirmedContract(workspace, requestedChapterId) {
-  const blueprint = workspace?.stages?.blueprint;
-  if (blueprint?.status !== 'ready' || !isPlainObject(blueprint.confirmed)) return null;
+function parseObject(value) {
+  if (isPlainObject(value)) return value;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
-  const confirmed = blueprint.confirmed;
-  const selected = confirmed.selectedChapter;
+function looksLikeChapterContract(value) {
+  if (!isPlainObject(value)) return false;
+  return [
+    'chapterId', 'chapterNumber', 'candidateTitle', 'title', 'chapterGoal', 'goal',
+    'coreConflict', 'chapterEndHook', 'endHook', 'hook', 'requiredBeats', 'mustInclude',
+  ].some((key) => Object.hasOwn(value, key));
+}
+
+function contractFromContainer(container, requestedChapterId) {
+  if (!isPlainObject(container)) return null;
+  const selected = container.selectedChapter;
   const candidates = [
-    confirmed.selectedChapterContract,
-    confirmed.selectedChapterContractCandidate,
-    confirmed.nextChapterContract,
-    confirmed.nextChapterContractCandidate,
-    confirmed.chapterContract,
-    confirmed.contract,
+    container.selectedChapterContract,
+    container.selectedChapterContractCandidate,
+    container.nextChapterContract,
+    container.nextChapterContractCandidate,
+    container.chapterContract,
+    container.contract,
     isPlainObject(selected) ? selected.contract || selected : null,
   ];
   let contract = candidates.find(hasContractValue);
 
   if (!contract) {
-    const collection = Array.isArray(confirmed.chapterContracts)
-      ? confirmed.chapterContracts
-      : Array.isArray(confirmed.chapters)
-        ? confirmed.chapters
+    const collection = Array.isArray(container.chapterContracts)
+      ? container.chapterContracts
+      : Array.isArray(container.chapters)
+        ? container.chapters
         : [];
     const selectedId = requestedChapterId
-      || confirmed.selectedChapterId
+      || container.selectedChapterId
       || (typeof selected === 'string' ? selected : undefined);
     if (selectedId) {
       contract = collection.find((item) => (
@@ -47,6 +65,45 @@ export function extractConfirmedContract(workspace, requestedChapterId) {
     } else if (collection.length === 1) {
       [contract] = collection;
     }
+  }
+
+  return contract;
+}
+
+function findConfirmedContract(confirmed, requestedChapterId) {
+  const root = parseObject(confirmed);
+  if (!root) return null;
+
+  const queue = [{ value: root, depth: 0 }];
+  const seen = new Set();
+  while (queue.length) {
+    const { value, depth } = queue.shift();
+    if (!isPlainObject(value) || seen.has(value)) continue;
+    seen.add(value);
+
+    const contract = contractFromContainer(value, requestedChapterId);
+    if (hasContractValue(contract)) return contract;
+    if (depth === 0 && looksLikeChapterContract(value)) return value;
+    if (depth >= 4) continue;
+
+    for (const child of Object.values(value)) {
+      if (isPlainObject(child)) queue.push({ value: child, depth: depth + 1 });
+    }
+  }
+  return null;
+}
+
+export function extractConfirmedContract(workspace, requestedChapterId) {
+  const blueprint = workspace?.stages?.blueprint;
+  if (blueprint?.status !== 'ready') return null;
+
+  let contract = findConfirmedContract(blueprint.confirmed, requestedChapterId);
+  if (!hasContractValue(contract)) {
+    // Existing Workspaces may keep the author-written contract in blueprint.input.
+    // The UI has always treated this field as the chapter-writing contract. Once
+    // the whole blueprint stage is author-confirmed, the persisted input is also
+    // an author-controlled formal source and can safely satisfy the writer gate.
+    contract = blueprint.input?.chapterContract;
   }
 
   if (!hasContractValue(contract)) return null;
