@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
-import { extractConfirmedContract } from './workspace-contract.mjs';
+import {
+  extractConfirmedContract,
+  prepareConfirmedBlueprintForWriter,
+  prepareConfirmedContractForWriter,
+} from './workspace-contract.mjs';
 
 function workspaceWithBlueprint(blueprint) {
   return { stages: { blueprint } };
@@ -107,5 +111,19 @@ assert.deepEqual(
   candidateContract,
   '确认稿本身就是章节契约时应直接使用',
 );
+
+const writerContract = prepareConfirmedContractForWriter(candidateContract);
+assert.equal(writerContract.status, 'confirmed', '传给 writer 的契约必须明确标记为已确认');
+assert.equal(writerContract.confirmed, true, '传给 writer 的契约不能保留模型候选态');
+assert.equal(candidateContract.status, 'candidate', '规范化 writer 契约不能修改 Workspace 原对象');
+assert.equal(candidateContract.confirmed, false, '规范化 writer 契约不能修改 Workspace 原确认字段');
+
+const writerBlueprint = prepareConfirmedBlueprintForWriter({
+  positioning: { genre: '仙侠' },
+  nextChapterContractCandidate: candidateContract,
+});
+assert.equal(writerBlueprint.nextChapterContractCandidate.status, 'confirmed');
+assert.equal(writerBlueprint.nextChapterContractCandidate.confirmed, true);
+assert.equal(writerBlueprint.positioning.genre, '仙侠');
 
 console.log('workspace contract smoke passed');

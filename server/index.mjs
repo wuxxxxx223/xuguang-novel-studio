@@ -26,7 +26,11 @@ import {
   acquireInstanceLock, assertRuntimeFilesystem, inspectRuntimeFilesystem, loadRuntimeConfig, requestOriginAllowed,
 } from './runtime-config.mjs';
 import { inspectCheckpointIntegrity } from './operational-integrity.mjs';
-import { extractConfirmedContract } from './workspace-contract.mjs';
+import {
+  extractConfirmedContract,
+  prepareConfirmedBlueprintForWriter,
+  prepareConfirmedContractForWriter,
+} from './workspace-contract.mjs';
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(SERVER_DIR, '..');
@@ -1002,9 +1006,40 @@ function buildAiPayload(role, body, persistedWorkspace) {
         requiredBlueprintStatus: 'ready',
       });
     }
-    payload.workspace = persistedWorkspace;
-    payload.confirmedBlueprint = persistedWorkspace.stages.blueprint.confirmed;
-    payload.confirmedChapterContract = contract;
+    const confirmedContract = prepareConfirmedContractForWriter(contract);
+    const confirmedBlueprint = prepareConfirmedBlueprintForWriter(persistedWorkspace.stages.blueprint.confirmed);
+    payload.workspace = {
+      project: cloneJson(persistedWorkspace.project),
+      currentChapter: cloneJson(persistedWorkspace.currentChapter),
+      stages: {
+        idea: {
+          status: persistedWorkspace.stages.idea.status,
+          confirmed: cloneJson(persistedWorkspace.stages.idea.confirmed),
+        },
+        logic: {
+          status: persistedWorkspace.stages.logic.status,
+          confirmed: cloneJson(persistedWorkspace.stages.logic.confirmed),
+        },
+        blueprint: {
+          status: persistedWorkspace.stages.blueprint.status,
+          confirmed: confirmedBlueprint,
+        },
+        draft: {
+          text: String(persistedWorkspace.stages.draft.text ?? ''),
+        },
+      },
+    };
+    if (isPlainObject(payload.context?.upstream)) {
+      payload.context = cloneJson(payload.context);
+      payload.context.upstream.blueprint = confirmedBlueprint;
+    }
+    payload.confirmedBlueprint = confirmedBlueprint;
+    payload.confirmedChapterContract = confirmedContract;
+    payload.contractConfirmation = {
+      confirmed: true,
+      source: 'persisted_workspace_blueprint_ready',
+      blueprintStatus: persistedWorkspace.stages.blueprint.status,
+    };
   }
   assertSafeJson(payload, { name: 'AI payload', forbidCredentials: true });
   return payload;

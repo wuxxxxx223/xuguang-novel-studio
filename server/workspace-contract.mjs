@@ -34,6 +34,20 @@ function looksLikeChapterContract(value) {
   ].some((key) => Object.hasOwn(value, key));
 }
 
+function markConfirmedContracts(value) {
+  if (Array.isArray(value)) return value.map(markConfirmedContracts);
+  if (!isPlainObject(value)) return value;
+
+  const normalized = Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [key, markConfirmedContracts(child)]),
+  );
+  if (looksLikeChapterContract(normalized)) {
+    normalized.status = 'confirmed';
+    normalized.confirmed = true;
+  }
+  return normalized;
+}
+
 function contractFromContainer(container, requestedChapterId) {
   if (!isPlainObject(container)) return null;
   const selected = container.selectedChapter;
@@ -118,4 +132,16 @@ export function extractConfirmedContract(workspace, requestedChapterId) {
   // or confirmed=false) describes the suggestion before the author accepted it
   // and must not override that later author decision.
   return cloneJson(contract);
+}
+
+export function prepareConfirmedContractForWriter(contract) {
+  if (typeof contract === 'string') return contract.trim();
+  if (!isPlainObject(contract)) return contract;
+  return markConfirmedContracts(cloneJson(contract));
+}
+
+export function prepareConfirmedBlueprintForWriter(confirmedBlueprint) {
+  const parsed = parseObject(confirmedBlueprint);
+  if (!parsed) return confirmedBlueprint;
+  return markConfirmedContracts(cloneJson(parsed));
 }
