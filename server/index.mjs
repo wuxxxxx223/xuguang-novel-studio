@@ -110,6 +110,10 @@ const ROLE_BOUNDARIES = Object.freeze({
   idea: [
     '你是 Idea 收敛角色，只整理候选建议，不替作者确认。',
     '提炼高概念、读者承诺、差异点、关键假设和待验证缺口；禁止写小说正文或把推测写成事实。',
+    '当 PAYLOAD.ideation.mode 为 draw 时，从零发明一套可持续写成长篇小说的商业创意，不要依赖作者已经拥有完整 Idea。',
+    '当 ideation.unrestricted 为 true 时，大胆随机组合题材、人物身份、核心矛盾和独特机制，但组合必须内在自洽，不得只堆流行元素。',
+    '当 ideation.constraints 非空时，把它仅视为大概方向或禁用条件：遵守约束，但不要复述约束代替创意，也不要擅自补成作者已确认事实。',
+    '抽卡结果除通用字段外，建议包含 titleCandidates（3 个）、genreDirection、protagonist、coreConflict、noveltyCombination、openingPromise，方便作者快速判断。',
     '当 PAYLOAD.refinement.mode 为 iterate 时，基于 currentSuggestion 与作者 feedback 生成下一版：保留作者未否定的有效部分，明确解决本轮反馈，不要退回空泛模板。',
     '迭代时仍返回一份可独立阅读的完整 Idea 替代稿，不输出差异、讨论记录、解释性前言或确认语。',
     'JSON 至少包含：highConcept、readerPromise、differentiators、assumptions、gaps；可保留并完善当前稿中有价值的额外结构字段。',
@@ -154,7 +158,15 @@ function defaultWorkspace() {
     project: { title: '', genre: '', audience: '', tone: '' },
     currentStage: 'idea',
     stages: {
-      idea: { status: 'editing', input: '', suggestion: null, refinementFeedback: '', iterations: [], confirmed: null },
+      idea: {
+        status: 'editing',
+        input: '',
+        draw: { mode: 'random', constraints: '' },
+        suggestion: null,
+        refinementFeedback: '',
+        iterations: [],
+        confirmed: null,
+      },
       logic: { status: 'empty', input: {}, suggestion: null, confirmed: null },
       blueprint: { status: 'empty', suggestion: null, confirmed: null },
       draft: { status: 'empty', text: '', suggestion: null, confirmed: null },
@@ -587,6 +599,19 @@ function normalizeWorkspace(input, revisionOverride) {
       throw new HttpError(400, 'INVALID_WORKSPACE', `workspace.stages.${stage} 必须是对象。`);
     }
     workspace.stages[stage] = { ...fallback.stages[stage], ...workspace.stages[stage] };
+    if (stage === 'idea') {
+      if (!isPlainObject(workspace.stages.idea.draw)) {
+        throw new HttpError(400, 'INVALID_WORKSPACE', 'workspace.stages.idea.draw 必须是对象。');
+      }
+      workspace.stages.idea.draw = { ...fallback.stages.idea.draw, ...workspace.stages.idea.draw };
+      if (!['random', 'guided'].includes(workspace.stages.idea.draw.mode)) {
+        throw new HttpError(400, 'INVALID_IDEA_DRAW_MODE', 'workspace.stages.idea.draw.mode 必须是 random 或 guided。');
+      }
+      workspace.stages.idea.draw.constraints = String(workspace.stages.idea.draw.constraints ?? '');
+      if (workspace.stages.idea.draw.constraints.length > 4000) {
+        throw new HttpError(400, 'IDEA_DRAW_CONSTRAINTS_TOO_LONG', 'Idea 抽卡方向不能超过 4000 字符。');
+      }
+    }
     if (!STAGE_STATUSES.has(workspace.stages[stage].status)) {
       throw new HttpError(400, 'INVALID_WORKSPACE_STATUS', `workspace.stages.${stage}.status 无效。`);
     }
@@ -954,6 +979,7 @@ function buildAiPayload(role, body, persistedWorkspace) {
   const input = hasOwn(body, 'input') ? body.input : body.prompt ?? null;
   const context = hasOwn(body, 'context') ? body.context : null;
   const refinement = hasOwn(body, 'refinement') ? body.refinement : null;
+  const ideation = hasOwn(body, 'ideation') ? body.ideation : null;
   assertSafeJson(input, { name: 'input', forbidCredentials: true });
   assertSafeJson(context, { name: 'context', forbidCredentials: true });
   if (refinement != null) {
@@ -971,6 +997,18 @@ function buildAiPayload(role, body, persistedWorkspace) {
     }
     assertSafeJson(refinement, { name: 'refinement', forbidCredentials: true });
   }
+  if (ideation != null) {
+    if (role !== 'idea') throw new HttpError(400, 'IDEATION_ROLE_INVALID', '灵感抽卡上下文只允许用于 Idea。');
+    if (refinement != null) throw new HttpError(400, 'IDEATION_REFINEMENT_CONFLICT', '灵感抽卡与多轮打磨不能在同一次请求中运行。');
+    assertObject(ideation, 'ideation');
+    if (ideation.mode !== 'draw') throw new HttpError(400, 'IDEATION_MODE_INVALID', 'ideation.mode 必须是 draw。');
+    const constraints = String(ideation.constraints ?? '').trim();
+    if (constraints.length > 4000) throw new HttpError(400, 'IDEATION_CONSTRAINTS_TOO_LONG', '灵感抽卡方向不能超过 4000 字符。');
+    if (typeof ideation.unrestricted !== 'boolean') {
+      throw new HttpError(400, 'IDEATION_UNRESTRICTED_INVALID', 'ideation.unrestricted 必须是布尔值。');
+    }
+    assertSafeJson(ideation, { name: 'ideation', forbidCredentials: true });
+  }
   let workspace = persistedWorkspace;
   if (hasOwn(body, 'workspace')) workspace = normalizeWorkspace(body.workspace);
   const compactRefinement = refinement ? {
@@ -984,14 +1022,20 @@ function buildAiPayload(role, body, persistedWorkspace) {
       createdAt: item?.createdAt ?? null,
     })),
   } : null;
+  const compactIdeation = ideation ? {
+    mode: 'draw',
+    unrestricted: ideation.unrestricted,
+    constraints: String(ideation.constraints ?? '').trim(),
+  } : null;
   const payload = role === 'idea'
     ? {
         role,
-        input,
-        context,
-        project: persistedWorkspace.project,
-        currentChapter: persistedWorkspace.currentChapter,
+        input: compactIdeation ? null : input,
+        context: compactIdeation ? null : context,
+        project: compactIdeation ? { title: '', genre: '', audience: '', tone: '' } : persistedWorkspace.project,
+        currentChapter: compactIdeation ? null : persistedWorkspace.currentChapter,
         ...(compactRefinement ? { refinement: compactRefinement } : {}),
+        ...(compactIdeation ? { ideation: compactIdeation } : {}),
       }
     : { role, input, context, workspace, ...(compactRefinement ? { refinement: compactRefinement } : {}) };
   if (role === 'writer') {

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { getProjectCalibrations, runProjectCalibration } from './api.js';
+import ChapterLogicAlignment from './ChapterLogicAlignment.jsx';
 import {
   AlertTriangle, ArrowRight, BookCheck, BookOpenText, Check, CheckCircle2,
   ChevronDown, ChevronUp, Circle, ClipboardCheck, DatabaseBackup, FileText, Flag,
@@ -242,7 +243,7 @@ export function ProjectContractWorkspace({
   );
 }
 export function ProjectChapterWorkspace({
-  dashboard, chapterWorkspace, draftText, dirty, busy, writerReady, writerRoute,
+  dashboard, chapterWorkspace, formalContract, draftText, dirty, busy, writerReady, writerRoute,
   onDraftChange, onSave, onGenerate, onReview, onOpenModelLab, onSettings,
 }) {
   const { project, today, chapter } = dashboard;
@@ -340,10 +341,13 @@ export function ProjectChapterWorkspace({
           <button type="button" className="secondary-button compact-button" onClick={onOpenModelLab}><Gauge size={15} />{writerReady ? '模型路由与校准' : '先配置写作模型'}</button>
         </div>
       </header>
-      <section className="paper-card contract-brief-card">
-        <div className="contract-brief-head"><span><ClipboardCheck size={17} />{chapter.contractPath}</span><strong>{chapter.contractReady ? '契约已就绪' : '契约缺失'}</strong></div>
-        <p>{chapter.contractPreview || '当前章节还没有可读取的契约。'}</p>
-      </section>
+      <ChapterLogicAlignment
+        contract={formalContract?.text || chapter.contractPreview}
+        draftText={draftText}
+        draftTitle={candidate.title || chapter.title}
+        contractLabel={chapter.contractPath || '当前章正式契约'}
+        draftLabel="当前小说正文候选"
+      />
 
       {generationGateOpen && <section className="paper-card generation-preflight-card" aria-label="候选正文生成任务包">
         <div className="generation-preflight-head">
@@ -438,7 +442,7 @@ export function ProjectChapterWorkspace({
   );
 }
 export function ProjectReviewWorkspace({
-  dashboard, chapterWorkspace, busy, reviewReady, onRunReview, onConfirm, onBackToDraft, onWriteBack, onSettings,
+  dashboard, chapterWorkspace, formalContract, busy, reviewReady, onRunReview, onConfirm, onBackToDraft, onWriteBack, onSettings,
 }) {
   const candidate = chapterWorkspace?.candidate ?? {};
   const review = chapterWorkspace?.review ?? {};
@@ -471,18 +475,13 @@ export function ProjectReviewWorkspace({
         </span>
       </header>
 
-      <section className="paper-card review-candidate-summary">
-        <div>
-          <span className="section-kicker">当前审查对象</span>
-          <h2>{candidate.title || `第 ${dashboard.chapter.number} 章候选稿`}</h2>
-          <p>{String(candidate.text ?? '').slice(0, 220) || '候选稿为空。'}{String(candidate.text ?? '').length > 220 ? '…' : ''}</p>
-        </div>
-        <div className="review-candidate-facts">
-          <span><strong>{String(candidate.text ?? '').replace(/\s+/g, '').length}</strong> 字</span>
-          <span><strong>r{chapterWorkspace?.revision ?? 0}</strong> 账本版本</span>
-          <span><strong>{candidate.source === 'model' ? '模型' : '手写'}</strong> 来源</span>
-        </div>
-      </section>
+      <ChapterLogicAlignment
+        contract={formalContract?.text || dashboard.chapter.contractPreview}
+        draftText={candidate.text}
+        draftTitle={candidate.title || `第 ${dashboard.chapter.number} 章候选稿`}
+        contractLabel={dashboard.chapter.contractPath || '当前章正式契约'}
+        draftLabel={`当前审查正文 · r${chapterWorkspace?.revision ?? 0}`}
+      />
 
       {currentReview ? (
         <>

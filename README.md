@@ -2,7 +2,18 @@
 
 全新独立的 AI 小说创作工作台，不依赖旧 `workbench/` 或 `novel-compiler/studio` 前端。
 
-## 本地运行
+本仓库只同步产品代码。作者 Workspace、小说正文、模型密钥和运行数据均保留在本地或生产数据目录，不进入 Git。
+
+## 开发运行
+
+```bash
+npm ci
+npm run dev
+```
+
+访问 `http://127.0.0.1:5178/`，API 运行在 `http://127.0.0.1:8790/`。
+
+## 本地生产模式
 
 ```bash
 npm ci
@@ -15,6 +26,16 @@ npm start
 模型密钥只保存在本项目 `.data/settings.json`，前端只能读取脱敏后的配置状态。
 
 模型配置支持多个 OpenAI-compatible API 服务渠道，并可为 Idea、逻辑、蓝图、写作和审查阶段分别路由到不同渠道与模型 ID。API Key 必须与对应渠道的 Base URL 配套，模型品牌只通过模型 ID 指定。
+
+## 团队协作
+
+- 从 `main` 创建 `feat/*` 或 `fix/*` 分支。
+- 通过 Pull Request 合并，不直接在多人环境中改写 `main` 历史。
+- 提交前至少执行 `npm run check` 和 `npm run test:all`。
+- `.data/`、`.env*`、模型密钥、作者正文和生产备份不得提交。
+- GitHub Actions 会对 `main` 和 Pull Request 执行构建与 smoke tests。
+
+详细约定见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ## 当前真实项目工作流
 

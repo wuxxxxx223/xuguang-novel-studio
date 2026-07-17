@@ -17,11 +17,16 @@ import {
   STAGES, STATUS_META, canAccessStage, countRisks, createSettings,
   createWorkspace, editStage, extractFindings, extractSuggestion,
   firstActionableStage, getModelRoute, getNextStage, getPreviousStage, getStage,
-  getStageIndex, humanizeKey, normalizeSettings, normalizeWorkspace,
+  getStageIndex, humanizeKey, markDownstreamStale, normalizeSettings, normalizeWorkspace,
   summarizeArtifact, tryParseJson, valueToText,
 } from './state.js';
 import { ProjectChapterWorkspace, ProjectContractWorkspace, ProjectInspector, ProjectModelLab, ProjectReviewWorkspace, ProjectTodayWorkspace, ProjectWriteBackWorkspace } from './ProjectDashboard.jsx';
+import IdeaDrawPanel from './IdeaDrawPanel.jsx';
 import IdeaWorkshop from './IdeaWorkshop.jsx';
+import StoryEngineWorkshop from './StoryEngineWorkshop.jsx';
+import BlueprintWorkshop from './BlueprintWorkshop.jsx';
+import DraftWorkshop from './DraftWorkshop.jsx';
+import ReviewWorkshop from './ReviewWorkshop.jsx';
 
 const NAV_ITEMS = [
   { id: 'today', label: '今日', icon: Home },
@@ -125,6 +130,10 @@ export default function App() {
   const serverRevisionRef = useRef(0);
   const workspaceSaveQueueRef = useRef(Promise.resolve());
   const toastTimerRef = useRef(null);
+  const workspaceRef = useRef(workspace);
+  const activeProjectIdRef = useRef(activeProjectId);
+  const projectRequestEpochRef = useRef(0);
+  const generationEpochRef = useRef(0);
 
   const notify = useCallback((message, tone = 'neutral') => {
     clearTimeout(toastTimerRef.current);
@@ -232,6 +241,24 @@ export default function App() {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
+  useEffect(() => {
+    workspaceRef.current = workspace;
+  }, [workspace]);
+
+  useEffect(() => {
+    activeProjectIdRef.current = activeProjectId;
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!projectContractDirty && !projectDraftDirty) return undefined;
+    const handler = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [projectContractDirty, projectDraftDirty]);
+
   const projectViews = ['today', 'project-contract', 'project-chapter', 'model-lab', 'project-review', 'project-writeback'];
   const activeStageId = projectViews.includes(view) ? (view === 'today' ? firstActionableStage(workspace).id : ['project-review', 'project-writeback'].includes(view) ? 'review' : view === 'project-contract' ? 'blueprint' : 'draft') : view;
   const activeStage = getStage(activeStageId);
@@ -274,7 +301,22 @@ export default function App() {
     document.title = `${project} · ${page} — 叙光`;
   }, [workspace.project.title, view, activeStage.label, projectDashboard]);
 
+  const confirmProjectLeave = useCallback(() => {
+    if (!projectContractDirty && !projectDraftDirty) return true;
+    const parts = [];
+    if (projectContractDirty) parts.push('章节契约');
+    if (projectDraftDirty) parts.push('候选正文');
+    return window.confirm(`${parts.join('和')}还有未保存修改。离开会放弃这些修改，确定继续吗？`);
+  }, [projectContractDirty, projectDraftDirty]);
+
   const enterOriginWorkspace = useCallback(() => {
+    if (projectChapterBusy) {
+      notify('当前章节操作仍在执行，请完成后再切换创作模式', 'warning');
+      return;
+    }
+    if (!confirmProjectLeave()) return;
+    projectRequestEpochRef.current += 1;
+    activeProjectIdRef.current = '';
     setProjectOpen(false);
     setCommandOpen(false);
     setActiveProjectId('');
@@ -290,16 +332,24 @@ export default function App() {
     setView('today');
     window.scrollTo({ top: 0, behavior: 'smooth' });
     notify('已返回开书重建，从 Idea 开始打磨', 'success');
-  }, [notify]);
+  }, [confirmProjectLeave, notify, projectChapterBusy]);
 
   const selectProject = useCallback(async (projectId) => {
     setProjectOpen(false);
     if (!projectId || (projectId === activeProjectId && projectDashboard)) return;
+    if (projectChapterBusy) {
+      notify('当前章节操作仍在执行，请完成后再切换作品', 'warning');
+      return;
+    }
+    if (!confirmProjectLeave()) return;
+    const requestEpoch = ++projectRequestEpochRef.current;
     try {
       const [dashboardResponse, chapterResponse] = await Promise.all([
         getProjectDashboard(projectId), getProjectChapterWorkspace(projectId),
       ]);
+      if (requestEpoch !== projectRequestEpochRef.current) return;
       const nextChapterWorkspace = chapterResponse?.chapterWorkspace ?? null;
+      activeProjectIdRef.current = projectId;
       setActiveProjectId(projectId);
       const formalContract = chapterResponse?.formalContract ?? { exists: false, relativePath: '', text: '' };
       const template = chapterResponse?.contractTemplate ?? '';
@@ -316,9 +366,10 @@ export default function App() {
       setView('today');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (error) {
+      if (requestEpoch !== projectRequestEpochRef.current) return;
       notify(toErrorMessage(error), 'error');
     }
-  }, [activeProjectId, notify, projectDashboard]);
+  }, [activeProjectId, confirmProjectLeave, notify, projectChapterBusy, projectDashboard]);
 
   const navigate = useCallback((target) => {
     setProjectOpen(false);
@@ -375,13 +426,17 @@ export default function App() {
   }, [updateWorkspace]);
 
   const updateSuggestion = useCallback((stageId, suggestion) => {
-    updateWorkspace((current) => ({
-      ...current,
-      stages: {
-        ...current.stages,
-        [stageId]: { ...current.stages[stageId], suggestion, status: 'suggested' },
-      },
-    }));
+    updateWorkspace((current) => {
+      const currentArtifact = current.stages[stageId];
+      const next = {
+        ...current,
+        stages: {
+          ...current.stages,
+          [stageId]: { ...currentArtifact, suggestion, status: 'suggested' },
+        },
+      };
+      return currentArtifact.confirmed != null ? markDownstreamStale(next, stageId) : next;
+    });
   }, [updateWorkspace]);
 
   const updateIdeaFeedback = useCallback((feedback) => {
@@ -394,22 +449,41 @@ export default function App() {
     }));
   }, [updateWorkspace]);
 
-  const restoreIdeaIteration = useCallback((iteration) => {
-    if (!iteration?.suggestion) return;
+  const updateIdeaDraw = useCallback((draw) => {
     updateWorkspace((current) => ({
       ...current,
       stages: {
         ...current.stages,
         idea: {
           ...current.stages.idea,
-          status: 'suggested',
-          suggestion: cloneValue(iteration.suggestion),
-          refinementFeedback: '',
-          restoredFrom: iteration.version,
-          error: null,
+          draw: {
+            mode: draw?.mode === 'guided' ? 'guided' : 'random',
+            constraints: String(draw?.constraints ?? ''),
+          },
         },
       },
     }));
+  }, [updateWorkspace]);
+
+  const restoreIdeaIteration = useCallback((iteration) => {
+    if (!iteration?.suggestion) return;
+    updateWorkspace((current) => {
+      const next = {
+        ...current,
+        stages: {
+          ...current.stages,
+          idea: {
+            ...current.stages.idea,
+            status: 'suggested',
+            suggestion: cloneValue(iteration.suggestion),
+            refinementFeedback: '',
+            restoredFrom: iteration.version,
+            error: null,
+          },
+        },
+      };
+      return current.stages.idea.confirmed != null ? markDownstreamStale(next, 'idea') : next;
+    });
     notify(`已把第 ${iteration.version} 版恢复为当前工作稿；历史版本未删除`, 'success');
   }, [notify, updateWorkspace]);
 
@@ -424,8 +498,16 @@ export default function App() {
       notify(`请先补全 ${getStage(stageId).label} 的模型配置`, 'warning');
       return;
     }
+    const missingUpstream = STAGES
+      .slice(0, getStageIndex(stageId))
+      .find((stage) => workspace.stages[stage.id]?.status !== 'ready');
+    if (missingUpstream) {
+      notify(`请先确认${missingUpstream.label}，当前阶段不能基于旧上游生成`, 'warning');
+      return;
+    }
 
     const isIdeaRefinement = stageId === 'idea' && options.mode === 'iterate';
+    const isIdeaDraw = stageId === 'idea' && options.mode === 'draw';
     const ideaArtifact = stageId === 'idea' ? workspace.stages.idea : null;
     const feedback = isIdeaRefinement ? String(ideaArtifact?.refinementFeedback ?? '').trim() : '';
     if (isIdeaRefinement && ideaArtifact?.suggestion == null) {
@@ -455,6 +537,17 @@ export default function App() {
           history: ideaHistory.slice(-6).map(compactIdeaIterationForPrompt),
         }
       : null;
+    const ideaDraw = isIdeaDraw ? {
+      mode: ideaArtifact?.draw?.mode === 'guided' ? 'guided' : 'random',
+      constraints: String(ideaArtifact?.draw?.constraints ?? '').trim(),
+    } : null;
+    const ideation = isIdeaDraw ? {
+      mode: 'draw',
+      unrestricted: ideaDraw.mode === 'random',
+      constraints: ideaDraw.mode === 'guided' ? ideaDraw.constraints : '',
+    } : null;
+    const generationEpoch = ++generationEpochRef.current;
+    const generationSignature = buildGenerationSignature(snapshot, stageId);
 
     const persisted = await persistWorkspace(snapshot, false);
     if (!persisted) {
@@ -482,7 +575,24 @@ export default function App() {
         input: getStageInput(snapshot, stageId),
         context: buildGenerationContext(snapshot, stageId),
         refinement,
+        ideation,
       });
+      if (generationEpoch !== generationEpochRef.current) return;
+      if (generationSignature !== buildGenerationSignature(workspaceRef.current, stageId)) {
+        updateWorkspace((current) => ({
+          ...current,
+          stages: {
+            ...current.stages,
+            [stageId]: {
+              ...current.stages[stageId],
+              status: 'stale',
+              staleFrom: stageId,
+            },
+          },
+        }));
+        notify('生成期间作者输入发生变化，本次结果未覆盖当前工作稿；请重新生成', 'warning');
+        return;
+      }
       const suggestion = extractSuggestion(response);
       const findings = stageId === 'review' ? extractFindings(response, suggestion) : undefined;
       const run = buildRun({ stageId, status: 'success', settings, startedAt, response });
@@ -490,8 +600,14 @@ export default function App() {
         ? createIdeaIteration({
             version: nextIdeaVersion(ideaHistory),
             suggestion,
-            source: 'model',
-            feedback: isIdeaRefinement ? feedback : ideaHistory.length ? '基于当前作者输入重新生成完整 Idea' : '初始生成',
+            source: isIdeaDraw ? 'draw' : 'model',
+            feedback: isIdeaRefinement
+              ? feedback
+              : isIdeaDraw
+                ? ideaDraw.mode === 'guided' && ideaDraw.constraints
+                  ? `方向约束：${ideaDraw.constraints.slice(0, 300)}`
+                  : '完全随机抽卡'
+                : ideaHistory.length ? '基于当前作者输入重新生成完整 Idea' : '初始生成',
             run,
           })
         : null;
@@ -512,8 +628,11 @@ export default function App() {
         },
         runs: [...(current.runs ?? []), run].slice(-30),
       }));
-      notify(stageId === 'idea' ? `第 ${ideaIteration.version} 版 Idea 已返回；可继续反馈，不会自动定稿` : '建议稿已返回，确认前不会覆盖作者内容', 'success');
+      notify(stageId === 'idea'
+        ? `第 ${ideaIteration.version} 版 Idea 已返回；${isIdeaDraw ? '抽卡结果' : '当前结果'}只进入建议稿`
+        : '建议稿已返回，确认前不会覆盖作者内容', 'success');
     } catch (error) {
+      if (generationEpoch !== generationEpochRef.current) return;
       const message = toErrorMessage(error);
       const run = buildRun({ stageId, status: 'error', settings, startedAt, error });
       updateWorkspace((current) => ({
@@ -541,9 +660,10 @@ export default function App() {
     updateWorkspace((current) => {
       const currentArtifact = current.stages[stageId];
       const confirmed = cloneValue(currentArtifact.suggestion);
+      const confirmedChanged = currentArtifact.confirmed != null && !sameJsonValue(currentArtifact.confirmed, confirmed);
       const findings = extractFindings({}, confirmed);
       const ideaIterations = stageId === 'idea' ? prepareIdeaIterations(currentArtifact) : null;
-      return {
+      const next = {
         ...current,
         stages: {
           ...current.stages,
@@ -555,6 +675,7 @@ export default function App() {
           },
         },
       };
+      return confirmedChanged ? markDownstreamStale(next, stageId) : next;
     });
     notify(stageId === 'idea' ? '当前 Idea 已由你定稿，故事引擎现已解锁' : '已写入作者确认稿，下游阶段现已可继续', 'success');
   }, [notify, updateWorkspace, workspace]);
@@ -568,7 +689,8 @@ export default function App() {
     return nextChapterWorkspace;
   }, []);
 
-  const applyProjectChapterResponse = useCallback((response) => {
+  const applyProjectChapterResponse = useCallback((response, options = {}) => {
+    const { preserveLocal = false } = options;
     const nextChapterWorkspace = response?.chapterWorkspace ?? null;
     const formalContract = response?.formalContract ?? { exists: false, relativePath: '', text: '' };
     const template = response?.contractTemplate ?? '';
@@ -576,17 +698,23 @@ export default function App() {
     setProjectFormalContract(formalContract);
     setProjectContractTemplate(template);
     setProjectChapterWorkspace(nextChapterWorkspace);
-    setProjectContractText(savedContract || (!formalContract.exists ? template : ''));
-    setProjectContractDirty(!savedContract && !formalContract.exists && Boolean(template));
-    setProjectDraftText(nextChapterWorkspace?.candidate?.text ?? '');
-    setProjectDraftDirty(false);
+    if (!preserveLocal || !projectContractDirty) {
+      setProjectContractText(savedContract || (!formalContract.exists ? template : ''));
+      setProjectContractDirty(!savedContract && !formalContract.exists && Boolean(template));
+    }
+    if (!preserveLocal || !projectDraftDirty) {
+      setProjectDraftText(nextChapterWorkspace?.candidate?.text ?? '');
+      setProjectDraftDirty(false);
+    }
     return nextChapterWorkspace;
-  }, []);
+  }, [projectContractDirty, projectDraftDirty]);
 
-  const refreshProjectChapterWorkspace = useCallback(async () => {
+  const refreshProjectChapterWorkspace = useCallback(async (options = {}) => {
     if (!activeProjectId) return null;
+    const projectId = activeProjectId;
     const response = await getProjectChapterWorkspace(activeProjectId);
-    return applyProjectChapterResponse(response);
+    if (activeProjectIdRef.current !== projectId) return null;
+    return applyProjectChapterResponse(response, options);
   }, [activeProjectId, applyProjectChapterResponse]);
 
   const saveProjectContract = useCallback(async () => {
@@ -602,7 +730,7 @@ export default function App() {
       notify('章节契约已保存到侧车账本；正式大纲未改动', 'success');
       return true;
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
       return false;
     } finally {
@@ -627,7 +755,7 @@ export default function App() {
       applyProjectChapterWorkspace(response?.chapterWorkspace ?? null);
       notify('逻辑模型已生成侧车契约；正式大纲未改动', 'success');
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
     } finally {
       setProjectChapterBusy('');
@@ -646,7 +774,7 @@ export default function App() {
       applyProjectChapterWorkspace(response?.chapterWorkspace ?? null);
       notify('正式契约差异预览已生成；尚未写入项目', 'success');
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
     } finally {
       setProjectChapterBusy('');
@@ -672,7 +800,7 @@ export default function App() {
       notify('章节契约 checkpoint 已创建，正式契约已写入；现在可以开始候选正文', 'success');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
     } finally {
       setProjectChapterBusy('');
@@ -692,7 +820,7 @@ export default function App() {
       notify('候选稿已安全保存；正式正文未改动', 'success');
       return true;
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
       return false;
     } finally {
@@ -717,7 +845,7 @@ export default function App() {
       applyProjectChapterWorkspace(response?.chapterWorkspace ?? null);
       notify(mode === 'full' ? '模型候选已生成并保存到侧车账本；正式正文未改动' : '定向重写已完成并保存为新的候选版本；正式正文未改动', 'success');
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
     } finally {
       setProjectChapterBusy('');
@@ -742,7 +870,7 @@ export default function App() {
       setView('project-review');
       notify('只读审查完成；正文没有被模型改写', 'success');
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
     } finally {
       setProjectChapterBusy('');
@@ -757,7 +885,7 @@ export default function App() {
       applyProjectChapterWorkspace(response?.chapterWorkspace ?? null);
       notify(response?.formalWritePerformed === false ? '当前候选版本已确认；正式正文仍未写入' : '当前候选版本已确认', 'success');
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
     } finally {
       setProjectChapterBusy('');
@@ -776,7 +904,7 @@ export default function App() {
       applyProjectChapterWorkspace(response?.chapterWorkspace ?? null);
       notify('正式文件差异预览已生成；尚未写入磁盘项目', 'success');
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
     } finally {
       setProjectChapterBusy('');
@@ -795,7 +923,7 @@ export default function App() {
       applyProjectChapterWorkspace(response?.chapterWorkspace ?? null);
       notify(response?.formalWritePerformed ? 'Checkpoint 已创建，当前章与追踪账本已正式写入' : '写回请求完成', 'success');
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace().catch(() => null);
+      if (error instanceof ApiError && error.status === 409) await refreshProjectChapterWorkspace({ preserveLocal: true }).catch(() => null);
       notify(toErrorMessage(error), 'error');
     } finally {
       setProjectChapterBusy('');
@@ -823,18 +951,10 @@ export default function App() {
     }
   }, [activeProjectId, applyProjectChapterResponse, notify]);
   const establishProject = useCallback(() => {
-    if (!workspace.project.title.trim()) {
-      notify('先给作品一个名称', 'warning');
-      return;
-    }
-    if (!String(workspace.stages.idea.input ?? '').trim()) {
-      notify('至少记录一句原始灵感', 'warning');
-      return;
-    }
     setView('idea');
     updateWorkspace((current) => ({ ...current, currentStage: 'idea' }));
-    notify('作品已建立，下一步收敛 Idea', 'success');
-  }, [notify, updateWorkspace, workspace.project.title, workspace.stages.idea.input]);
+    notify('已进入 Idea；可以手写，也可以直接抽卡', 'success');
+  }, [notify, updateWorkspace]);
 
   const handlePrimaryAction = useCallback(() => {
     if (view === 'today') {
@@ -845,7 +965,11 @@ export default function App() {
           return;
         }
         navigate('project-chapter');
-      } else if (!workspace.project.title.trim() || !String(workspace.stages.idea.input ?? '').trim()) establishProject();
+      } else if (
+        !String(workspace.stages.idea.input ?? '').trim()
+        && workspace.stages.idea.suggestion == null
+        && workspace.stages.idea.confirmed == null
+      ) establishProject();
       else navigate(firstActionableStage(workspace).id);
       return;
     }
@@ -910,7 +1034,8 @@ export default function App() {
         onSave={() => {
           setCommandOpen(false);
           if (projectDashboard && view === 'project-contract') saveProjectContract();
-          else if (projectDashboard && ['project-chapter', 'project-review'].includes(view)) saveProjectCandidate();
+          else if (projectDashboard && view === 'project-chapter') saveProjectCandidate();
+          else if (projectDashboard) notify('当前页面没有需要手动保存的编辑内容', 'neutral');
           else persistWorkspace(workspace, true);
         }}
         onExport={exportWorkspace}
@@ -958,6 +1083,7 @@ export default function App() {
             <ProjectChapterWorkspace
               dashboard={projectDashboard}
               chapterWorkspace={projectChapterWorkspace}
+              formalContract={projectFormalContract}
               draftText={projectDraftText}
               dirty={projectDraftDirty}
               busy={projectChapterBusy}
@@ -976,6 +1102,7 @@ export default function App() {
             <ProjectReviewWorkspace
               dashboard={projectDashboard}
               chapterWorkspace={projectChapterWorkspace}
+              formalContract={projectFormalContract}
               busy={projectChapterBusy}
               reviewReady={reviewReady}
               onRunReview={runProjectReview}
@@ -1001,6 +1128,8 @@ export default function App() {
               stageId={activeStageId} workspace={workspace} onProjectChange={editProject}
               onArtifactChange={(patch) => editArtifact(activeStageId, patch)}
               onSuggestionChange={(value) => updateSuggestion(activeStageId, value)}
+              onIdeaDrawChange={updateIdeaDraw}
+              onIdeaDraw={() => generateStage('idea', { mode: 'draw' })}
               onIdeaFeedbackChange={updateIdeaFeedback}
               onIdeaRefine={() => generateStage('idea', { mode: 'iterate' })}
               onIdeaConfirm={() => confirmSuggestion('idea')}
@@ -1103,11 +1232,12 @@ function TopBar({ workspace, view, activeStage, riskCount, saveState, projectOpe
 }
 
 function StageNavigation({ view, workspace, dashboard, chapterWorkspace, onNavigate }) {
+  const navListRef = useActiveNavIntoView(view);
   if (dashboard) return <ProjectNavigation view={view} dashboard={dashboard} chapterWorkspace={chapterWorkspace} onNavigate={onNavigate} />;
   return (
     <nav className="stage-nav" aria-label="创作阶段">
       <div className="stage-nav-heading"><span>创作路径</span><small>5 个产物阶段</small></div>
-      <div className="stage-nav-list">
+      <div className="stage-nav-list" ref={navListRef}>
         {NAV_ITEMS.map((item, index) => {
           const Icon = item.icon;
           const isToday = item.id === 'today';
@@ -1129,7 +1259,20 @@ function StageNavigation({ view, workspace, dashboard, chapterWorkspace, onNavig
   );
 }
 
+function useActiveNavIntoView(activeId) {
+  const listRef = useRef(null);
+  useEffect(() => {
+    if (!window.matchMedia('(max-width: 700px)').matches) return;
+    listRef.current?.querySelector('[aria-current="page"]')?.scrollIntoView({
+      block: 'nearest',
+      inline: 'center',
+    });
+  }, [activeId]);
+  return listRef;
+}
+
 function ProjectNavigation({ view, dashboard, chapterWorkspace, onNavigate }) {
+  const navListRef = useActiveNavIntoView(view);
   const contractReady = dashboard.chapter.contractReady;
   const contractDraft = chapterWorkspace?.contractDraft ?? {};
   const contractPlan = contractDraft.plan ?? {};
@@ -1157,7 +1300,7 @@ function ProjectNavigation({ view, dashboard, chapterWorkspace, onNavigate }) {
   ];
   return <nav className="stage-nav project-stage-nav" aria-label="项目日更路径">
     <div className="stage-nav-heading"><span>本章日更路径</span><small>CH {String(dashboard.chapter.number).padStart(3, '0')}</small></div>
-    <div className="stage-nav-list">{items.map((item, index) => {
+    <div className="stage-nav-list" ref={navListRef}>{items.map((item, index) => {
       const Icon = item.icon;
       const active = view === item.id;
       return <button type="button" key={item.id} className={`stage-nav-item ${active ? 'active' : ''} ${item.disabled ? 'locked' : ''}`} onClick={() => !item.disabled && onNavigate(item.id)} aria-current={active ? 'page' : undefined} aria-disabled={item.disabled}>
@@ -1171,7 +1314,13 @@ function ProjectNavigation({ view, dashboard, chapterWorkspace, onNavigate }) {
   </nav>;
 }
 function TodayWorkspace({ workspace, settings, onProjectChange, onIdeaChange }) {
-  const hasProject = Boolean(workspace.project.title.trim() && String(workspace.stages.idea.input ?? '').trim());
+  const hasProject = Boolean(
+    workspace.project.title.trim()
+    || String(workspace.stages.idea.input ?? '').trim()
+    || workspace.stages.idea.suggestion != null
+    || workspace.stages.idea.confirmed != null
+  );
+  const projectTitle = workspace.project.title.trim() || '未命名作品';
   const target = firstActionableStage(workspace);
   const targetArtifact = workspace.stages[target.id];
   const readyCount = STAGES.filter((stage) => workspace.stages[stage.id]?.status === 'ready').length;
@@ -1179,18 +1328,18 @@ function TodayWorkspace({ workspace, settings, onProjectChange, onIdeaChange }) 
     <div className="content-column today-content">
       <ContentHeader
         eyebrow="今日工作台"
-        title={hasProject ? `从 Idea 重新打磨「${workspace.project.title}」` : '从一个清晰的作品承诺开始'}
-        description={hasProject ? '先把这本书当作新书重新推演：不跳到第 4 章，只确认当前最重要的 Idea 产物。' : '建立作品、记录原始灵感，然后让每个产物依次接受你的确认。'}
+        title={hasProject ? `从 Idea 重新打磨「${projectTitle}」` : '从一个清晰的作品承诺开始'}
+        description={hasProject ? '先把这本书当作新书重新推演：不跳到第 4 章，只确认当前最重要的 Idea 产物。' : '可以先手写最小上下文，也可以直接进入 Idea 页让 AI 抽一张。'}
       />
       {!hasProject ? (
         <section className="paper-card start-card">
           <div className="card-heading-row"><div className="section-icon coral"><BookMarked size={19} /></div><div><span className="section-kicker">今天从这里开始</span><h2>建立这本书的最小上下文</h2></div></div>
           <div className="form-grid two-col">
-            <Field label="作品名" required><input value={workspace.project.title} onChange={(event) => onProjectChange({ title: event.target.value })} placeholder="例如：潮汐尽头的来信" autoFocus /></Field>
+            <Field label="作品名" hint="可稍后填写"><input value={workspace.project.title} onChange={(event) => onProjectChange({ title: event.target.value })} placeholder="例如：潮汐尽头的来信" autoFocus /></Field>
             <Field label="类型"><input value={workspace.project.genre} onChange={(event) => onProjectChange({ genre: event.target.value })} placeholder="悬疑 / 科幻 / 言情…" /></Field>
           </div>
-          <Field label="一句原始灵感" hint="不用完整，先留下最想写的矛盾或画面。" required><textarea rows={6} value={workspace.stages.idea.input ?? ''} onChange={(event) => onIdeaChange(event.target.value)} placeholder="当一个人发现……但他必须……否则……" /></Field>
-          <div className="quiet-note"><Sparkles size={15} /><span>建立作品不会调用模型；内容会先保存到独立 Workspace。</span></div>
+          <Field label="一句原始灵感" hint="可选；没有想法就直接进入 Idea 抽卡。"><textarea rows={6} value={workspace.stages.idea.input ?? ''} onChange={(event) => onIdeaChange(event.target.value)} placeholder="当一个人发现……但他必须……否则……" /></Field>
+          <div className="quiet-note"><Sparkles size={15} /><span>当前输入会先保存；进入 Idea 后才由你决定是否调用模型。</span></div>
         </section>
       ) : (
         <>
@@ -1226,19 +1375,31 @@ function TodayWorkspace({ workspace, settings, onProjectChange, onIdeaChange }) 
 
 function StageWorkspace({
   stageId, workspace, onProjectChange, onArtifactChange, onSuggestionChange,
-  onIdeaFeedbackChange, onIdeaRefine, onIdeaConfirm, onIdeaRestore, ideaConfigured, onIdeaSettings,
+  onIdeaDrawChange, onIdeaDraw, onIdeaFeedbackChange, onIdeaRefine,
+  onIdeaConfirm, onIdeaRestore, ideaConfigured, onIdeaSettings,
 }) {
   const artifact = workspace.stages[stageId];
   const copy = STAGE_COPY[stageId];
+  const hasDedicatedReader = ['logic', 'blueprint', 'draft', 'review'].includes(stageId);
+  const readerValue = artifact.status === 'ready'
+    ? artifact.confirmed
+    : artifact.suggestion ?? artifact.confirmed;
+  const readerArtifact = readerValue == null ? artifact : { ...artifact, suggestion: readerValue };
+  const readerReadOnly = artifact.status === 'ready' || artifact.suggestion == null;
   return (
     <div className="content-column">
       <ContentHeader eyebrow={copy.eyebrow} title={copy.title} description={copy.description} status={artifact.status} />
       <StageNotice stageId={stageId} artifact={artifact} />
+      {stageId === 'idea' && (
+        <IdeaDrawPanel
+          artifact={artifact}
+          configured={ideaConfigured}
+          onChange={onIdeaDrawChange}
+          onDraw={onIdeaDraw}
+          onSettings={onIdeaSettings}
+        />
+      )}
       {stageId === 'idea' && <IdeaEditor workspace={workspace} onProjectChange={onProjectChange} onChange={onArtifactChange} />}
-      {stageId === 'logic' && <StructuredEditor fields={LOGIC_FIELDS} value={artifact.input} onChange={(input) => onArtifactChange({ input })} intro="故事引擎账本" icon={Route} />}
-      {stageId === 'blueprint' && <BlueprintEditor workspace={workspace} fields={BLUEPRINT_FIELDS} value={artifact.input} onChange={(input) => onArtifactChange({ input })} />}
-      {stageId === 'draft' && <DraftEditor workspace={workspace} onChange={onArtifactChange} />}
-      {stageId === 'review' && <ReviewEditor workspace={workspace} onChange={onArtifactChange} />}
       {stageId === 'idea' && artifact.suggestion != null && artifact.status !== 'ready' ? (
         <IdeaWorkshop
           artifact={artifact}
@@ -1250,10 +1411,31 @@ function StageWorkspace({
           configured={ideaConfigured}
           onSettings={onIdeaSettings}
         />
-      ) : stageId !== 'idea' && artifact.suggestion != null ? (
-        <SuggestionPanel stageId={stageId} value={artifact.suggestion} findings={artifact.findings} onChange={onSuggestionChange} />
       ) : null}
-      {artifact.confirmed != null && <ConfirmedPanel value={artifact.confirmed} status={artifact.status} confirmedAt={artifact.confirmedAt} />}
+      {hasDedicatedReader && readerValue != null && (
+        <>
+          <ArtifactStatusStrip artifact={artifact} />
+          {stageId === 'logic' && <StoryEngineWorkshop artifact={readerArtifact} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
+          {stageId === 'blueprint' && <BlueprintWorkshop artifact={readerArtifact} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
+          {stageId === 'draft' && <DraftWorkshop artifact={readerArtifact} workspace={workspace} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
+          {stageId === 'review' && <ReviewWorkshop artifact={readerArtifact} workspace={workspace} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
+        </>
+      )}
+      {hasDedicatedReader && (
+        <StageSourcePanel
+          key={stageId}
+          stageId={stageId}
+          artifact={artifact}
+          summary={getStageSourceSummary(stageId, workspace)}
+          defaultOpen={readerValue == null}
+        >
+          {stageId === 'logic' && <StructuredEditor fields={LOGIC_FIELDS} value={artifact.input} onChange={(input) => onArtifactChange({ input })} intro="故事引擎账本" icon={Route} embedded />}
+          {stageId === 'blueprint' && <BlueprintEditor workspace={workspace} fields={BLUEPRINT_FIELDS} value={artifact.input} onChange={(input) => onArtifactChange({ input })} embedded />}
+          {stageId === 'draft' && <DraftEditor workspace={workspace} onChange={onArtifactChange} embedded />}
+          {stageId === 'review' && <ReviewEditor workspace={workspace} onChange={onArtifactChange} embedded />}
+        </StageSourcePanel>
+      )}
+      {stageId === 'idea' && artifact.confirmed != null && <ConfirmedPanel value={artifact.confirmed} status={artifact.status} confirmedAt={artifact.confirmedAt} />}
     </div>
   );
 }
@@ -1264,7 +1446,8 @@ function ContentHeader({ eyebrow, title, description, status }) {
 
 function StageNotice({ stageId, artifact }) {
   if (artifact.status === 'stale') {
-    return <div className="stage-notice stale-notice"><AlertTriangle size={18} /><div><strong>上游内容已经变化</strong><span>现有{getStage(stageId).label}仍保留，但不再代表最新上下文。请重新生成并确认，或先检查上游差异。</span></div></div>;
+    const ownInputChanged = artifact.staleFrom === stageId;
+    return <div className="stage-notice stale-notice"><AlertTriangle size={18} /><div><strong>{ownInputChanged ? '生成依据已经变化' : '上游内容已经变化'}</strong><span>现有{getStage(stageId).label}仍保留，但不再代表最新上下文。请重新生成并确认，或先检查输入差异。</span></div></div>;
   }
   if (artifact.status === 'error') {
     return <div className="stage-notice error-notice"><AlertCircle size={18} /><div><strong>模型调用失败，作者内容未丢失</strong><span>{artifact.error?.provider ? `${artifact.error.provider} · ` : ''}{artifact.error?.status ? `HTTP ${artifact.error.status} · ` : ''}{artifact.error?.message || '请检查配置后重试。'}</span></div></div>;
@@ -1286,12 +1469,12 @@ function IdeaEditor({ workspace, onProjectChange, onChange }) {
       </summary>
       <div className="idea-source-body">
         <div className="form-grid two-col">
-          <Field label="作品名" required><input value={workspace.project.title} onChange={(event) => onProjectChange({ title: event.target.value })} placeholder="作品名" /></Field>
+          <Field label="作品名" hint="可等抽卡后再定"><input value={workspace.project.title} onChange={(event) => onProjectChange({ title: event.target.value })} placeholder="作品名" /></Field>
           <Field label="类型"><input value={workspace.project.genre} onChange={(event) => onProjectChange({ genre: event.target.value })} placeholder="类型与题材" /></Field>
           <Field label="目标读者"><input value={workspace.project.audience} onChange={(event) => onProjectChange({ audience: event.target.value })} placeholder="最希望打动谁？" /></Field>
           <Field label="叙事语气"><input value={workspace.project.tone} onChange={(event) => onProjectChange({ tone: event.target.value })} placeholder="克制、黑色幽默、浪漫…" /></Field>
         </div>
-        <Field label="原始灵感" hint="保留你的措辞、矛盾与不确定性。这里是作者输入，不是模型结论。" required>
+        <Field label="原始灵感" hint="可选。保留你的措辞、矛盾与不确定性；这里是作者输入，不是模型结论。">
           <textarea className="large-textarea" rows={11} value={artifact.input ?? ''} onChange={(event) => onChange({ input: event.target.value })} placeholder="写下最初让你想讲这个故事的画面、人物或问题……" />
         </Field>
         <div className="prompt-notes"><span>可以不完整</span><span>优先写冲突</span><span>留下未知问题</span><span>不要提前写大纲</span></div>
@@ -1305,9 +1488,41 @@ function truncateIdeaSource(value, length = 88) {
   if (!text) return '尚未填写原始 Idea。';
   return text.length > length ? text.slice(0, length) + '…' : text;
 }
-function StructuredEditor({ fields, value = {}, onChange, intro, icon: Icon }) {
+function StageSourcePanel({ stageId, artifact, summary, defaultOpen, children }) {
+  const stage = getStage(stageId);
+  const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className="paper-card editor-card">
+    <details className="stage-source-panel" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>
+        <span className="stage-source-icon">{stageId === 'logic' ? <Route size={17} /> : stageId === 'blueprint' ? <PanelsTopLeft size={17} /> : stageId === 'draft' ? <PenLine size={17} /> : <ScanSearch size={17} />}</span>
+        <span className="stage-source-copy">
+          <strong>生成依据 · {stage.label}</strong>
+          <small>{summary}</small>
+        </span>
+        <span className="stage-source-state">{artifact.status === 'generating' ? '生成中' : '按需修改'}<ChevronDown size={15} /></span>
+      </summary>
+      <div className="stage-source-body">{children}</div>
+    </details>
+  );
+}
+
+function ArtifactStatusStrip({ artifact }) {
+  const ready = artifact.status === 'ready';
+  const stale = artifact.status === 'stale' || artifact.status === 'editing';
+  return (
+    <div className={`artifact-lifecycle ${ready ? 'confirmed' : stale ? 'stale' : 'suggested'}`}>
+      {ready ? <CheckCircle2 size={17} /> : stale ? <AlertTriangle size={17} /> : <Sparkles size={17} />}
+      <div>
+        <strong>{ready ? '作者确认稿' : stale ? '当前产物基于修改前的生成依据' : 'AI 建议稿，等待作者确认'}</strong>
+        <span>{ready ? `已进入 Workspace 账本${artifact.confirmedAt ? ` · ${formatDateTime(artifact.confirmedAt)}` : ''}` : stale ? '内容保留供比对；重新生成前不会覆盖。' : '默认使用阅读稿呈现，确认前不会成为正式事实。'}</span>
+      </div>
+    </div>
+  );
+}
+
+function StructuredEditor({ fields, value = {}, onChange, intro, icon: Icon, embedded = false }) {
+  return (
+    <section className={`${embedded ? 'embedded-editor' : 'paper-card'} editor-card`}>
       <div className="card-heading-row compact"><div className="section-icon ink"><Icon size={19} /></div><div><span className="section-kicker">作者账本</span><h2>{intro}</h2></div></div>
       <div className="structured-grid">
         {fields.map((field, index) => (
@@ -1320,22 +1535,22 @@ function StructuredEditor({ fields, value = {}, onChange, intro, icon: Icon }) {
   );
 }
 
-function BlueprintEditor({ workspace, fields, value = {}, onChange }) {
+function BlueprintEditor({ workspace, fields, value = {}, onChange, embedded = false }) {
   return (
     <>
       <section className="upstream-strip"><Route size={16} /><div><span>已确认故事引擎</span><p>{summarizeArtifact(workspace.stages.logic)}</p></div></section>
-      <StructuredEditor fields={fields} value={value} onChange={onChange} intro="长篇结构与下一章契约" icon={PanelsTopLeft} />
+      <StructuredEditor fields={fields} value={value} onChange={onChange} intro="长篇结构与下一章契约" icon={PanelsTopLeft} embedded={embedded} />
     </>
   );
 }
 
-function DraftEditor({ workspace, onChange }) {
+function DraftEditor({ workspace, onChange, embedded = false }) {
   const artifact = workspace.stages.draft;
   const contract = getChapterContract(workspace.stages.blueprint);
   return (
     <>
-      <section className="contract-card"><div className="contract-label"><ListChecks size={17} /><span>已确认章节契约</span></div><p>{contract || '蓝图中尚未提取到章节契约。请先确认小说蓝图。'}</p></section>
-      <section className="paper-card editor-card manuscript-card">
+      <section className="contract-card"><div className="contract-label"><ListChecks size={17} /><span>已确认章节契约</span></div><p>{summarizeChapterContract(contract) || '蓝图中尚未提取到章节契约。请先确认小说蓝图。'}</p></section>
+      <section className={`${embedded ? 'embedded-editor' : 'paper-card'} editor-card manuscript-card`}>
         <div className="chapter-heading"><div><span>CHAPTER {String(workspace.currentChapter?.number ?? 1).padStart(2, '0')}</span><h2>{workspace.currentChapter?.title || '未命名章节'}</h2></div><span className="word-count">{countChineseWords(artifact.text ?? '')} 字</span></div>
         <Field label="作者正文" hint="可以先手写，也可以等待模型正文候选。候选不会自动进入这里。">
           <textarea className="manuscript-textarea" rows={24} value={artifact.text ?? ''} onChange={(event) => onChange({ text: event.target.value })} placeholder="从第一个不可回避的动作开始……" />
@@ -1345,16 +1560,16 @@ function DraftEditor({ workspace, onChange }) {
   );
 }
 
-function ReviewEditor({ workspace, onChange }) {
+function ReviewEditor({ workspace, onChange, embedded = false }) {
   const artifact = workspace.stages.review;
-  const draftText = valueToText(workspace.stages.draft.confirmed ?? workspace.stages.draft.text ?? workspace.stages.draft.suggestion);
+  const draftText = getDraftBody(workspace.stages.draft.confirmed ?? workspace.stages.draft.text ?? workspace.stages.draft.suggestion);
   return (
     <>
-      <section className="paper-card review-source-card">
+      <section className={`${embedded ? 'embedded-editor' : 'paper-card'} review-source-card`}>
         <div className="card-heading-row compact"><div className="section-icon green"><FileText size={19} /></div><div><span className="section-kicker">待审章节</span><h2>{workspace.currentChapter?.title || '当前章节'}</h2></div><span className="word-count">{countChineseWords(draftText)} 字</span></div>
         <div className="review-excerpt">{draftText ? `${draftText.slice(0, 760)}${draftText.length > 760 ? '…' : ''}` : '尚无已确认章节正文。'}</div>
       </section>
-      <section className="paper-card editor-card">
+      <section className={`${embedded ? 'embedded-editor' : 'paper-card'} editor-card`}>
         <div className="card-heading-row compact"><div className="section-icon ink"><ScanSearch size={19} /></div><div><span className="section-kicker">审查范围</span><h2>本轮特别关注</h2></div></div>
         <Field label="作者审查要求" hint="可选。系统默认检查阻塞问题、节奏、逻辑、角色一致性与 AI 痕迹。">
           <textarea rows={6} value={artifact.input?.focus ?? ''} onChange={(event) => onChange({ input: { ...(artifact.input ?? {}), focus: event.target.value } })} placeholder="例如：重点检查第三场对话的信息重复，以及结尾钩子是否足够具体。" />
@@ -1460,7 +1675,7 @@ function Inspector({ open, stageId, workspace, settings, onClose, onSettings }) 
     <>
       {open && <button type="button" className="inspector-scrim" onClick={onClose} aria-label="关闭检查器" />}
       <aside className={`inspector ${open ? 'open' : ''}`} aria-label="上下文检查器">
-        <div className="inspector-mobile-head"><strong>上下文检查器</strong><button type="button" className="icon-button" onClick={onClose}><X size={18} /></button></div>
+        <div className="inspector-mobile-head"><strong>上下文检查器</strong><button type="button" className="icon-button" onClick={onClose} aria-label="关闭上下文检查器"><X size={18} /></button></div>
         <section className="inspector-section compass-section">
           <SectionTitle icon={Compass} label="作品指南针" />
           <h3>{workspace.project.title || '未命名作品'}</h3>
@@ -1716,7 +1931,12 @@ function LoadingScreen() {
 
 function getPrimaryAction({ view, workspace, stageId, configured }) {
   if (view === 'today') {
-    if (!workspace.project.title.trim() || !String(workspace.stages.idea.input ?? '').trim()) return { kicker: '唯一下一步', label: '建立作品并记录 Idea', hint: '先保存最小上下文，不会调用模型。', icon: 'check' };
+    const hasIdeaContext = Boolean(
+      String(workspace.stages.idea.input ?? '').trim()
+      || workspace.stages.idea.suggestion != null
+      || workspace.stages.idea.confirmed != null
+    );
+    if (!hasIdeaContext) return { kicker: '唯一下一步', label: '进入 Idea：手写或抽卡', hint: '不要求先有书名或完整想法；可以完全随机，也可以限定大概方向。', icon: 'sparkles' };
     const target = firstActionableStage(workspace);
     const targetStatus = workspace.stages[target.id].status;
     return { kicker: '唯一下一步', label: target.id === 'idea' ? (targetStatus === 'suggested' || targetStatus === 'error' ? '继续打磨 Idea' : '开始打磨 Idea') : `继续${target.label}`, hint: getTodayTaskDescription(target.id, targetStatus), icon: 'check' };
@@ -1750,8 +1970,31 @@ function getTodayTaskDescription(stageId, status) {
 function getStageInput(workspace, stageId) {
   const artifact = workspace.stages[stageId];
   if (stageId === 'draft') return artifact.text;
-  if (stageId === 'review') return { focus: artifact.input?.focus ?? '', draft: workspace.stages.draft.confirmed ?? workspace.stages.draft.text };
+  if (stageId === 'review') return { focus: artifact.input?.focus ?? '', draft: getDraftBody(workspace.stages.draft.confirmed ?? workspace.stages.draft.text) };
   return artifact.input;
+}
+
+function buildGenerationSignature(workspace, stageId) {
+  return JSON.stringify({
+    input: getStageInput(workspace, stageId),
+    context: buildGenerationContext(workspace, stageId),
+    refinementFeedback: stageId === 'idea' ? workspace.stages.idea.refinementFeedback ?? '' : '',
+    ideaDraw: stageId === 'idea' ? workspace.stages.idea.draw ?? null : null,
+  });
+}
+
+function getStageSourceSummary(stageId, workspace) {
+  const artifact = workspace.stages[stageId];
+  if (stageId === 'draft') {
+    const count = countChineseWords(artifact.text ?? '');
+    return count ? `作者正文 ${count} 字；展开后可继续手写或调整。` : '当前没有手写正文；展开后可补充作者稿。';
+  }
+  if (stageId === 'review') {
+    const focus = String(artifact.input?.focus ?? '').replace(/\s+/g, ' ').trim();
+    return focus ? truncateIdeaSource(focus, 86) : '使用默认审查轴；展开后可补充本轮特别关注。';
+  }
+  const summary = valueToText(artifact.input).replace(/\s+/g, ' ').trim();
+  return summary ? truncateIdeaSource(summary, 96) : `尚未填写${getStage(stageId).label}的作者生成依据。`;
 }
 
 function buildGenerationContext(workspace, stageId) {
@@ -1782,9 +2025,9 @@ function buildEntryConditions(workspace, settings, stageId) {
   if (index > 0) {
     const previous = STAGES[index - 1];
     conditions.push({ label: `${previous.label}已确认`, ok: workspace.stages[previous.id].status === 'ready' });
-  } else conditions.push({ label: '已记录原始灵感', ok: Boolean(String(workspace.stages.idea.input ?? '').trim()) });
+  } else conditions.push({ label: '可手写原始灵感或使用抽卡', ok: true });
   if (stageId === 'draft') conditions.push({ label: '章节契约可读取', ok: Boolean(getChapterContract(workspace.stages.blueprint)) });
-  if (stageId === 'review') conditions.push({ label: '章节正文可读取', ok: Boolean(valueToText(workspace.stages.draft.confirmed ?? workspace.stages.draft.text).trim()) });
+  if (stageId === 'review') conditions.push({ label: '章节正文可读取', ok: Boolean(getDraftBody(workspace.stages.draft.confirmed ?? workspace.stages.draft.text).trim()) });
   conditions.push({ label: `${getStage(stageId).label}模型已配置`, ok: route.configured });
   return conditions;
 }
@@ -1812,6 +2055,29 @@ function getChapterContract(blueprintArtifact) {
   const confirmed = tryParseJson(blueprintArtifact?.confirmed);
   if (confirmed && typeof confirmed === 'object' && !Array.isArray(confirmed)) return confirmed.chapterContract ?? confirmed.nextChapterContract ?? confirmed.nextChapterContractCandidate ?? confirmed.selectedChapterContract ?? confirmed.selectedChapterContractCandidate ?? confirmed.contract ?? '';
   return blueprintArtifact?.input?.chapterContract ?? '';
+}
+
+function summarizeChapterContract(contract) {
+  if (!contract) return '';
+  if (typeof contract === 'string') return contract;
+  if (typeof contract !== 'object' || Array.isArray(contract)) return valueToText(contract);
+  const chapter = contract.candidateTitle ?? contract.title;
+  const conflict = contract.coreConflict ?? contract.goal ?? contract.chapterGoal;
+  const hook = contract.chapterEndHook ?? contract.endHook ?? contract.hook;
+  return [
+    chapter ? `《${valueToText(chapter)}》` : '',
+    conflict ? `核心冲突：${valueToText(conflict)}` : '',
+    hook ? `章末钩子：${valueToText(hook)}` : '',
+  ].filter(Boolean).join(' · ') || valueToText(contract);
+}
+
+function getDraftBody(value) {
+  const parsed = tryParseJson(value);
+  if (typeof parsed === 'string') return parsed;
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return valueToText(parsed.draft ?? parsed.content ?? parsed.text ?? parsed.manuscript ?? parsed);
+  }
+  return valueToText(parsed);
 }
 
 function toErrorMessage(error) {
@@ -1882,6 +2148,7 @@ function sameJsonValue(left, right) {
 function formatIdeaSource(source) {
   if (source === 'author-edit') return '作者修订';
   if (source === 'restored') return '历史恢复';
+  if (source === 'draw') return '灵感抽卡';
   return '模型建议';
 }
 

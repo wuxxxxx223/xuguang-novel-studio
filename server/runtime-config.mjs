@@ -257,10 +257,23 @@ export function requestOriginAllowed(req, config) {
   if (fetchSite === 'cross-site') return false;
   const rawOrigin = String(req.get('origin') ?? '').trim();
   if (!rawOrigin) return true;
-  let origin;
-  try { origin = new URL(rawOrigin).origin; } catch { return false; }
+  let originUrl;
+  try { originUrl = new URL(rawOrigin); } catch { return false; }
+  const origin = originUrl.origin;
   if (config.trustedOrigins.includes(origin)) return true;
   const host = String(req.get('host') ?? '').trim();
   if (!host) return false;
-  return origin === `${req.protocol}://${host}`;
+  const requestOrigin = `${req.protocol}://${host}`;
+  if (origin === requestOrigin) return true;
+
+  // Vite serves the local development UI and API proxy on different ports.
+  // Permit that loopback-only topology without weakening production origin checks.
+  if (!config.production && config.networkBoundary === 'local') {
+    let requestUrl;
+    try { requestUrl = new URL(requestOrigin); } catch { return false; }
+    return originUrl.protocol === requestUrl.protocol
+      && isLoopbackHost(originUrl.hostname)
+      && isLoopbackHost(requestUrl.hostname);
+  }
+  return false;
 }

@@ -6,11 +6,11 @@ import {
 import { humanizeKey, tryParseJson } from './state.js';
 
 const IDEA_REFINEMENT_FOCI = [
-  { label: '金手指机制', instruction: '把“闭关如何稳定变强”的规则、代价、上限和可持续升级空间讲透。' },
-  { label: '闭关外爽点', instruction: '补强出关后的扮猪吃虎、越级打脸、身份错位与收益反差，让爽点可连续兑现。' },
-  { label: '主角动机', instruction: '让主角为什么执着闭死关、为什么被迫出关更具体，避免只是被动苟着。' },
-  { label: '长线悬念', instruction: '建立能跨卷推进的问题、敌人与真相，不让签到循环很快重复。' },
-  { label: '免费向开篇', instruction: '把前三章冲突、情绪、首个爽点和章末钩子前置到可直接落地的程度。' },
+  { label: '核心卖点', instruction: '把这套创意最值得追读的独特体验讲透，并说明如何持续兑现而不是只够写一个开篇。' },
+  { label: '主角动机', instruction: '让主角为什么必须行动、为什么不能退出更具体，避免只是被剧情推着走。' },
+  { label: '核心机制', instruction: '补清故事核心机制的规则、代价、上限和可持续升级空间。' },
+  { label: '开篇冲突', instruction: '把前三章冲突、情绪、首次兑现和章末钩子前置到可直接落地的程度。' },
+  { label: '长线悬念', instruction: '建立能跨卷推进的问题、对手与真相，避免核心循环很快重复。' },
 ];
 
 const IDEA_FIELD_LABELS = {
@@ -34,17 +34,22 @@ const IDEA_FIELD_LABELS = {
   mainPlotGain: '主线增量', tangibleGain: '明确收益', resourceGain: '资源收益', strengthGain: '实力收益', safetyGain: '安全收益',
   publicPerception: '外界认知', actualState: '真实状态', actualOverreach: '实际越界点', faceSlapProgression: '打脸递进',
   multiLayerSettlement: '多层清算', protagonistCompetence: '主角能力感', revealedTruth: '揭示真相', reasonForChoice: '选择理由',
-  closureGoal: '阶段收束目标',
+  closureGoal: '阶段收束目标', titleCandidates: '候选书名', genreDirection: '题材方向', protagonist: '主角',
+  coreConflict: '核心冲突', noveltyCombination: '新鲜组合', openingPromise: '开篇承诺',
 };
 
 const IDEA_SECTION_DEFINITIONS = [
   { id: 'highConcept', label: '高概念与书名兑现', description: '这本书究竟讲什么，核心问题是什么，书名如何持续兑现。', paths: ['highConcept'] },
+  { id: 'titleCandidates', label: '候选书名', description: '先看名字是否准确传达题材、冲突和阅读期待；不会自动采用。', paths: ['titleCandidates', 'titles'] },
+  { id: 'genreDirection', label: '题材与受众方向', description: '判断它更接近哪类作品，以及应该向谁兑现承诺。', paths: ['genreDirection', 'positioning'] },
   { id: 'readerPromise', label: '读者会持续得到什么', description: '可重复兑现的爽点、情绪和追读承诺。', paths: ['readerPromise', 'readerPromises'] },
-  { id: 'protagonistDrive', label: '主角为什么苟、为什么出关', description: '让主角的选择有主动性，而不是被剧情拖着走。', paths: ['protagonistDrive', 'motivation'] },
-  { id: 'growthMechanism', label: '金手指与成长规则', description: '能力从哪里来、付出什么、上限在哪里、如何继续升级。', paths: ['growthMechanism', 'recommendedMechanism', 'mechanism'] },
-  { id: 'coreLoop', label: '一轮故事怎么跑起来', description: '闭关、危机、出关、清算、带资源回去的连续循环。', paths: ['coreLoop', 'storyLoop'] },
-  { id: 'externalPayoffEngine', label: '出关后的爽点发动机', description: '身份错位、扮猪吃虎、越级打脸与收益反差如何连续发生。', paths: ['externalPayoffEngine', 'payoffEngine', 'outOfSeclusionPayoff'] },
-  { id: 'openingThreeChapters', label: '前三章如何落地', description: '开篇冲突、首个爽点、信息增量和章末钩子。', paths: ['openingThreeChapters', 'opening', 'goldenThreeChapters'] },
+  { id: 'protagonistDrive', label: '主角为什么必须行动', description: '看人物身份、欲望与退路是否咬合，而不是被剧情拖着走。', paths: ['protagonist', 'protagonistDrive', 'motivation'] },
+  { id: 'coreConflict', label: '核心冲突如何持续升级', description: '明确对手、阻力、失败代价，以及矛盾为什么不能轻易解决。', paths: ['coreConflict', 'mainConflict'] },
+  { id: 'growthMechanism', label: '核心机制与成长规则', description: '能力或故事机制从哪里来、付出什么、上限在哪里、如何继续升级。', paths: ['growthMechanism', 'recommendedMechanism', 'mechanism'] },
+  { id: 'noveltyCombination', label: '这次组合新鲜在哪里', description: '检查题材、人物身份和机制的组合是否形成真正差异，而不是流行元素堆叠。', paths: ['noveltyCombination'] },
+  { id: 'coreLoop', label: '一轮故事怎么跑起来', description: '危机、选择、对抗、结果与新问题如何形成可重复但会升级的循环。', paths: ['coreLoop', 'storyLoop'] },
+  { id: 'externalPayoffEngine', label: '冲突与兑现发动机', description: '读者期待的情绪、反转、成长或关系变化如何连续发生。', paths: ['externalPayoffEngine', 'payoffEngine', 'outOfSeclusionPayoff'] },
+  { id: 'openingThreeChapters', label: '开篇如何落地', description: '开篇冲突、首次兑现、信息增量和章末钩子。', paths: ['openingPromise', 'openingThreeChapters', 'opening', 'goldenThreeChapters'] },
   { id: 'longArc', label: '长线主线与分卷升级', description: '跨卷问题、敌人链条、主角变化和终局方向。', paths: ['longArc', 'longTermArc', 'volumeArchitecture'] },
   { id: 'differentiators', label: '和同类书有什么不同', description: '判断这个方案是不是只换皮，以及差异能否写成长线。', paths: ['differentiators', 'differentiation'] },
   { id: 'assumptions', label: '模型做了哪些待确认假设', description: '这些不是正式设定，需要作者逐项保留、修改或推翻。', paths: ['assumptions'], tone: 'caution' },
@@ -99,7 +104,7 @@ export default function IdeaWorkshop({ artifact, onSuggestionChange, onFeedbackC
           value={feedback}
           onChange={(event) => onFeedbackChange(event.target.value)}
           disabled={busy}
-          placeholder="例如：保留闭关签到的反差，但现在闭关变强太像普通挂机。请把收益机制、出关代价和闭关外连续爽点重新咬合，并给出至少三轮可升级循环。"
+          placeholder="例如：保留普通人误入超自然调查的身份反差，但现在核心机制太像常规升级流。请重做代价、对手升级和连续三轮可兑现的故事循环。"
         />
         <div className="idea-focus-chips" aria-label="快速聚焦">
           {IDEA_REFINEMENT_FOCI.map((focus) => <button type="button" key={focus.label} onClick={() => addFocus(focus)} disabled={busy}>+ {focus.label}</button>)}
@@ -311,7 +316,12 @@ function truncateIdeaText(value, length = 160) {
 function cloneValue(value) { return value == null ? value : JSON.parse(JSON.stringify(value)); }
 function sameJsonValue(left, right) { try { return JSON.stringify(left) === JSON.stringify(right); } catch { return left === right; } }
 function nextIdeaVersion(iterations) { return Math.max(0, ...iterations.map((item) => Number(item?.version) || 0)) + 1; }
-function formatIdeaSource(source) { return source === 'author-edit' ? '作者修改' : source === 'restored' ? '恢复版本' : '模型建议'; }
+function formatIdeaSource(source) {
+  if (source === 'author-edit') return '作者修改';
+  if (source === 'restored') return '恢复版本';
+  if (source === 'draw') return '灵感抽卡';
+  return '模型建议';
+}
 function formatDateTime(value) {
   if (!value) return '时间未知';
   const date = new Date(value);

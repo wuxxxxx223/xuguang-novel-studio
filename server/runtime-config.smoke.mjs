@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireInstanceLock, assertRuntimeFilesystem, inspectRuntimeFilesystem, loadRuntimeConfig } from './runtime-config.mjs';
+import {
+  acquireInstanceLock,
+  assertRuntimeFilesystem,
+  inspectRuntimeFilesystem,
+  loadRuntimeConfig,
+  requestOriginAllowed,
+} from './runtime-config.mjs';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'novel-studio-runtime-'));
 const projectDir = path.join(root, 'app');
@@ -71,6 +77,34 @@ try {
       NOVEL_STUDIO_LIBRARY_ROOT: libraryRoot,
     },
   }), /互不嵌套/);
+
+  const developmentConfig = loadRuntimeConfig({
+    projectDir,
+    env: {
+      NODE_ENV: 'development',
+      HOST: '127.0.0.1',
+      NOVEL_STUDIO_DATA_DIR: dataDir,
+      NOVEL_STUDIO_LIBRARY_ROOT: libraryRoot,
+    },
+  });
+  const request = ({ origin, host = '127.0.0.1:8790', fetchSite = 'same-site' }) => ({
+    protocol: 'http',
+    get(name) {
+      return {
+        origin,
+        host,
+        'sec-fetch-site': fetchSite,
+      }[String(name).toLowerCase()];
+    },
+  });
+  assert.equal(requestOriginAllowed(request({ origin: 'http://127.0.0.1:5178' }), developmentConfig), true);
+  assert.equal(requestOriginAllowed(request({ origin: 'http://localhost:5178' }), developmentConfig), true);
+  assert.equal(requestOriginAllowed(request({ origin: 'https://attacker.example' }), developmentConfig), false);
+  assert.equal(requestOriginAllowed(request({
+    origin: 'http://127.0.0.1:5178',
+    fetchSite: 'cross-site',
+  }), developmentConfig), false);
+  assert.equal(requestOriginAllowed(request({ origin: 'http://127.0.0.1:5178' }), config), false);
 
   console.log('runtime-config smoke passed');
 } finally {

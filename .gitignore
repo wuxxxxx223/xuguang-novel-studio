@@ -2,3 +2,16 @@ node_modules/
 dist/
 .data/
 *.log
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Test and editor artifacts
+coverage/
+.tmp-e2e/
+.DS_Store
+.idea/
+.vscode/

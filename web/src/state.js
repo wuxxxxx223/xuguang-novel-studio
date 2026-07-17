@@ -19,7 +19,15 @@ export const STATUS_META = {
 const allowedStatuses = new Set(Object.keys(STATUS_META));
 
 const stageDefaults = {
-  idea: { status: 'editing', input: '', suggestion: null, refinementFeedback: '', iterations: [], confirmed: null },
+  idea: {
+    status: 'editing',
+    input: '',
+    draw: { mode: 'random', constraints: '' },
+    suggestion: null,
+    refinementFeedback: '',
+    iterations: [],
+    confirmed: null,
+  },
   logic: {
     status: 'empty',
     input: { desire: '', resistance: '', stakes: '', escalation: '', mystery: '' },
@@ -64,6 +72,12 @@ export function normalizeWorkspace(payload) {
         typeof fallback.input === 'object' && fallback.input !== null
           ? { ...fallback.input, ...(incoming.input && typeof incoming.input === 'object' ? incoming.input : {}) }
           : incoming.input ?? fallback.input,
+      ...(stage.id === 'idea' ? {
+        draw: {
+          ...fallback.draw,
+          ...(incoming.draw && typeof incoming.draw === 'object' ? incoming.draw : {}),
+        },
+      } : {}),
     };
   }
 

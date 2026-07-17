@@ -47,7 +47,8 @@ assert.equal(completed.status, 'awaiting_scores');
 assert.equal(manager.describe(projectId, completed.benchmarkId).active, false);
 
 let thrown = await runningBenchmark(2, 'b');
-manager.schedule({ projectId, benchmarkId: thrown.benchmarkId, task: async () => { throw Object.assign(new Error('token sk-test-secretsecretsecret'), { code: 'UPSTREAM_FAIL' }); } });
+const fakeCredential = ['sk', 'test', 'secretsecretsecret'].join('-');
+manager.schedule({ projectId, benchmarkId: thrown.benchmarkId, task: async () => { throw Object.assign(new Error(`token ${fakeCredential}`), { code: 'UPSTREAM_FAIL' }); } });
 assert.equal(await manager.waitForIdle(), true);
 thrown = await harness.getBenchmark(projectId, thrown.benchmarkId, { publicView: false });
 assert.equal(thrown.status, 'stale');
