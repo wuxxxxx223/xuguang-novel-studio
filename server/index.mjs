@@ -29,6 +29,8 @@ import {
 import { inspectCheckpointIntegrity } from './operational-integrity.mjs';
 import {
   extractConfirmedContract,
+  extractConfirmedCurrentChapterContract,
+  isChapterCycleWorkspace,
   prepareConfirmedBlueprintForWriter,
   prepareConfirmedContractForWriter,
 } from './workspace-contract.mjs';
@@ -136,6 +138,7 @@ const ROLE_BOUNDARIES = Object.freeze({
   ].join('\n'),
   review: [
     '你是严格只读审查角色，只能诊断、评分、标注证据并提出抽象修改建议。',
+    '只能审查 PAYLOAD.confirmedDraft 与 PAYLOAD.confirmedChapterContract 中由服务端提供的内容；不得把候选蓝图或调用方输入当作已确认事实。',
     '禁止改写正文，禁止提供替换稿、代写段落或可直接粘贴的版本，禁止声称已经修改或保存内容。',
     '按 P0/P1/P2 检查阻塞、逻辑、节奏、人物一致性和 AI 痕迹。JSON 字段：verdict、scores、findings、strengths、recommendedActions。',
   ].join('\n'),
@@ -158,6 +161,13 @@ function defaultWorkspace() {
     revision: 0,
     project: { title: '', genre: '', audience: '', tone: '' },
     currentStage: 'idea',
+    chapterCycleVersion: 1,
+    chapterHistory: [],
+    currentChapter: {
+      number: 1,
+      title: '第一章',
+      contract: emptyCurrentChapterContract(),
+    },
     stages: {
       idea: {
         status: 'editing',
@@ -182,6 +192,194 @@ function isPlainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 function hasOwn(value, key) { return Object.prototype.hasOwnProperty.call(value, key); }
+function emptyCurrentChapterContract() {
+  return {
+    status: 'unconfirmed',
+    candidate: null,
+    confirmed: null,
+    source: null,
+    proposedAt: null,
+    confirmedAt: null,
+  };
+}
+function hasChapterContractValue(value) {
+  return (isPlainObject(value) && Object.keys(value).length > 0)
+    || (typeof value === 'string' && value.trim().length > 0);
+}
+function contractChapterNumber(value) {
+  if (!isPlainObject(value)) return null;
+  const raw = value.chapterNumber ?? value.chapterId ?? value.number
+    ?? (typeof value.id === 'number' || /^\d+$/.test(String(value.id ?? '')) ? value.id : null);
+  const number = Number(raw);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
+function assertContractMatchesCurrentChapter(contract, chapterNumber) {
+  const contractNumber = contractChapterNumber(contract);
+  if (contractNumber != null && contractNumber !== Number(chapterNumber)) {
+    throw new HttpError(409, 'CURRENT_CHAPTER_CONTRACT_NUMBER_MISMATCH', '当前章契约中的章节号必须与 currentChapter.number 一致。');
+  }
+}
+function normalizeCurrentChapterContract(value) {
+  if (value == null) return emptyCurrentChapterContract();
+  if (!isPlainObject(value)) throw new HttpError(400, 'INVALID_CURRENT_CHAPTER_CONTRACT', 'currentChapter.contract 必须是对象。');
+  const status = ['unconfirmed', 'suggested', 'confirmed'].includes(value.status) ? value.status : 'unconfirmed';
+  const candidate = value.candidate ?? null;
+  const confirmed = value.confirmed ?? null;
+  if (status === 'confirmed' && !hasChapterContractValue(confirmed)) {
+    throw new HttpError(400, 'CURRENT_CHAPTER_CONTRACT_REQUIRED', '已确认的当前章契约必须包含作者确认内容。');
+  }
+  return {
+    ...emptyCurrentChapterContract(),
+    ...cloneJson(value),
+    status,
+    candidate: candidate == null ? null : cloneJson(candidate),
+    confirmed: status === 'confirmed' ? cloneJson(confirmed) : null,
+    source: value.source == null ? null : cloneJson(value.source),
+    proposedAt: value.proposedAt ?? null,
+    confirmedAt: status === 'confirmed' ? value.confirmedAt ?? null : null,
+  };
+}
+function normalizeCurrentChapter(value, chapterCycleVersion) {
+  if (value != null && !isPlainObject(value)) throw new HttpError(400, 'INVALID_CURRENT_CHAPTER', 'workspace.currentChapter 必须是对象。');
+  const raw = value ?? {};
+  const number = Number(raw.number ?? 1);
+  if (!Number.isInteger(number) || number < 1) {
+    throw new HttpError(400, 'INVALID_CURRENT_CHAPTER_NUMBER', '当前章节号必须是正整数。');
+  }
+  const title = String(raw.title ?? `第 ${number} 章`).trim();
+  if (title.length > 200) throw new HttpError(400, 'CURRENT_CHAPTER_TITLE_TOO_LONG', '当前章节标题不能超过 200 字符。');
+  return {
+    ...cloneJson(raw),
+    number,
+    title: title || `第 ${number} 章`,
+    contract: chapterCycleVersion === 1 ? normalizeCurrentChapterContract(raw.contract) : emptyCurrentChapterContract(),
+  };
+}
+function normalizeChapterHistory(value, chapterCycleVersion) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new HttpError(400, 'INVALID_CHAPTER_HISTORY', 'chapterHistory 必须是数组。');
+  if (value.length > 2_000) throw new HttpError(400, 'CHAPTER_HISTORY_LIMIT', 'chapterHistory 最多 2000 章。');
+  if (chapterCycleVersion !== 1) return [];
+  let previousNumber = 0;
+  return value.map((entry, index) => {
+    if (!isPlainObject(entry)) throw new HttpError(400, 'INVALID_CHAPTER_HISTORY', `chapterHistory[${index}] 必须是对象。`);
+    const chapterNumber = Number(entry.chapterNumber);
+    if (!Number.isInteger(chapterNumber) || chapterNumber < 1 || chapterNumber <= previousNumber) {
+      throw new HttpError(400, 'INVALID_CHAPTER_HISTORY_ORDER', '章节历史必须按严格递增的章节号保存。');
+    }
+    previousNumber = chapterNumber;
+    if (!hasChapterContractValue(entry.contract?.value) || entry.draft?.value == null || entry.review?.value == null) {
+      throw new HttpError(400, 'INVALID_COMPLETED_CHAPTER', '已完成章节必须保留确认契约、正文与审查快照。');
+    }
+    return cloneJson(entry);
+  });
+}
+function sameJson(first, second) { return JSON.stringify(first) === JSON.stringify(second); }
+function assertArchivedChapterMatchesCurrent(entry, current) {
+  if (current.stages?.draft?.status !== 'ready' || current.stages?.draft?.confirmed == null) {
+    throw new HttpError(409, 'CHAPTER_DRAFT_CONFIRMATION_REQUIRED', '归档前必须先由作者确认当前章正文。');
+  }
+  if (current.stages?.review?.status !== 'ready' || current.stages?.review?.confirmed == null || current.stages?.review?.accepted !== true) {
+    throw new HttpError(409, 'CHAPTER_REVIEW_CONFIRMATION_REQUIRED', '归档前必须先完成并采纳当前章审查结论。');
+  }
+  if (isChapterCycleWorkspace(current) && current.currentChapter?.contract?.status !== 'confirmed') {
+    throw new HttpError(409, 'CURRENT_CHAPTER_CONTRACT_CONFIRMATION_REQUIRED', '归档前必须先确认当前章契约。');
+  }
+  if (Number(entry?.chapterNumber) !== Number(current?.currentChapter?.number)) {
+    throw new HttpError(409, 'CHAPTER_HISTORY_NUMBER_INVALID', '归档章节必须与当前章节号一致。');
+  }
+  const currentContract = isChapterCycleWorkspace(current)
+    ? current.currentChapter?.contract?.confirmed
+    : extractConfirmedContract(current, current.currentChapter?.number);
+  assertContractMatchesCurrentChapter(currentContract, current.currentChapter?.number);
+  if (!hasChapterContractValue(currentContract) || !sameJson(entry.contract?.value, currentContract)) {
+    throw new HttpError(409, 'CHAPTER_HISTORY_CONTRACT_MISMATCH', '归档章节必须使用当前已确认章节契约。');
+  }
+  if (entry.draft?.value == null || !sameJson(entry.draft.value, current.stages?.draft?.confirmed)) {
+    throw new HttpError(409, 'CHAPTER_HISTORY_DRAFT_MISMATCH', '归档章节必须使用当前已确认正文。');
+  }
+  if (entry.review?.value == null || !sameJson(entry.review.value, current.stages?.review?.confirmed)) {
+    throw new HttpError(409, 'CHAPTER_HISTORY_REVIEW_MISMATCH', '归档章节必须使用当前已确认审查。');
+  }
+}
+function validateCurrentChapterContractTransition(current, next) {
+  const previous = current.currentChapter?.contract ?? emptyCurrentChapterContract();
+  const incoming = next.currentChapter?.contract ?? emptyCurrentChapterContract();
+  if (previous.status === 'unconfirmed') {
+    if (incoming.status === 'unconfirmed') {
+      if (incoming.candidate != null || incoming.confirmed != null) {
+        throw new HttpError(409, 'CURRENT_CHAPTER_CONTRACT_STATE_INVALID', '未提出的章节契约不能包含候选或确认内容。');
+      }
+      return;
+    }
+    if (incoming.status === 'suggested' && incoming.candidate != null && incoming.confirmed == null) {
+      assertContractMatchesCurrentChapter(incoming.candidate, next.currentChapter?.number);
+      return;
+    }
+    throw new HttpError(409, 'CURRENT_CHAPTER_CONTRACT_CONFIRMATION_REQUIRED', '当前章契约必须先保存为待确认建议，才能由作者确认。');
+  }
+  if (previous.status === 'suggested') {
+    if (incoming.status === 'suggested' && incoming.confirmed == null) {
+      assertContractMatchesCurrentChapter(incoming.candidate, next.currentChapter?.number);
+      return;
+    }
+    if (
+      incoming.status === 'confirmed'
+      && sameJson(incoming.candidate, previous.candidate)
+      && sameJson(incoming.confirmed, previous.candidate)
+    ) {
+      assertContractMatchesCurrentChapter(incoming.confirmed, next.currentChapter?.number);
+      return;
+    }
+    throw new HttpError(409, 'CURRENT_CHAPTER_CONTRACT_CONFIRMATION_REQUIRED', '作者确认必须基于已保存且未变更的当前章契约候选。');
+  }
+  if (
+    incoming.status !== 'confirmed'
+    || !sameJson(incoming.candidate, previous.candidate)
+    || !sameJson(incoming.confirmed, previous.confirmed)
+  ) {
+    throw new HttpError(409, 'CURRENT_CHAPTER_CONTRACT_IMMUTABLE', '当前章已确认契约不可直接修改；请完成本章后创建下一章契约。');
+  }
+  assertContractMatchesCurrentChapter(incoming.confirmed, next.currentChapter?.number);
+}
+function validateWorkspaceTransition(current, next) {
+  const currentUsesCycle = isChapterCycleWorkspace(current);
+  const nextUsesCycle = isChapterCycleWorkspace(next);
+  if (!currentUsesCycle && !nextUsesCycle) return;
+  if (currentUsesCycle && !nextUsesCycle) {
+    throw new HttpError(409, 'CHAPTER_CYCLE_DOWNGRADE_FORBIDDEN', '连续写作 Workspace 不能降级为旧章节状态。');
+  }
+
+  const currentHistory = currentUsesCycle ? current.chapterHistory : [];
+  const nextHistory = next.chapterHistory;
+  const currentNumber = Number(current.currentChapter?.number);
+  const nextNumber = Number(next.currentChapter?.number);
+  const historyPrefixLength = currentHistory.length;
+  if (!nextHistory.slice(0, historyPrefixLength).every((entry, index) => sameJson(entry, currentHistory[index]))) {
+    throw new HttpError(409, 'CHAPTER_HISTORY_IMMUTABLE', '已完成章节历史不可修改、删除或重排。');
+  }
+
+  const expectedNextNumber = currentNumber + 1;
+  const isArchivingCurrent = nextNumber === expectedNextNumber && nextHistory.length === historyPrefixLength + 1;
+  if (!currentUsesCycle && nextUsesCycle && !isArchivingCurrent) {
+    throw new HttpError(409, 'CHAPTER_CYCLE_MIGRATION_INVALID', '旧 Workspace 只能在完成当前章时迁移到连续写作状态。');
+  }
+  if (nextNumber === currentNumber && nextHistory.length === historyPrefixLength) {
+    if (currentUsesCycle) validateCurrentChapterContractTransition(current, next);
+    return;
+  }
+  if (!isArchivingCurrent) {
+    throw new HttpError(409, 'CHAPTER_SEQUENCE_INVALID', '章节只能在完成当前章后顺序推进，不能跳章或重复归档。');
+  }
+
+  assertArchivedChapterMatchesCurrent(nextHistory.at(-1), current);
+  if (next.stages?.draft?.status !== 'empty' || next.stages?.review?.status !== 'empty') {
+    throw new HttpError(409, 'NEXT_CHAPTER_RUNTIME_NOT_RESET', '推进下一章前必须清空上一章的正文与审查运行态。');
+  }
+  if (next.currentChapter?.contract?.status === 'confirmed' || next.currentChapter?.contract?.confirmed != null) {
+    throw new HttpError(409, 'NEXT_CHAPTER_CONTRACT_UNCONFIRMED', '下一章契约只能先作为待确认建议保存。');
+  }
+}
 function assertObject(value, name) {
   if (!isPlainObject(value)) throw new HttpError(400, 'INVALID_JSON_OBJECT', `${name} 必须是 JSON 对象。`);
 }
@@ -589,10 +787,17 @@ function publicSettings(settings) {
 function normalizeWorkspace(input, revisionOverride) {
   assertObject(input, 'workspace');
   assertSafeJson(input, { name: 'workspace', forbidCredentials: true });
+  if (input.chapterCycleVersion != null && ![0, 1, '0', '1'].includes(input.chapterCycleVersion)) {
+    throw new HttpError(400, 'INVALID_CHAPTER_CYCLE_VERSION', 'chapterCycleVersion 必须是 0 或 1。');
+  }
   const fallback = defaultWorkspace();
+  const chapterCycleVersion = Number(input.chapterCycleVersion) === 1 ? 1 : 0;
   const workspace = { ...fallback, ...cloneJson(input) };
   if (!isPlainObject(workspace.project)) throw new HttpError(400, 'INVALID_WORKSPACE', 'workspace.project 必须是对象。');
   workspace.project = { ...fallback.project, ...workspace.project };
+  workspace.chapterCycleVersion = chapterCycleVersion;
+  workspace.currentChapter = normalizeCurrentChapter(input.currentChapter, chapterCycleVersion);
+  workspace.chapterHistory = normalizeChapterHistory(input.chapterHistory, chapterCycleVersion);
   if (!isPlainObject(workspace.stages)) throw new HttpError(400, 'INVALID_WORKSPACE', 'workspace.stages 必须是对象。');
   workspace.stages = { ...fallback.stages, ...workspace.stages };
   for (const stage of Object.keys(fallback.stages)) {
@@ -1046,22 +1251,35 @@ function buildAiPayload(role, body, persistedWorkspace) {
       }
     : { role, input, context, workspace, ...(compactRefinement ? { refinement: compactRefinement } : {}) };
   if (role === 'writer') {
-    const contract = extractConfirmedContract(persistedWorkspace, body.chapterId);
+    const usesChapterCycle = isChapterCycleWorkspace(persistedWorkspace);
+    const requestedChapterId = body.chapterId ?? persistedWorkspace.currentChapter?.number;
+    const contract = usesChapterCycle
+      ? extractConfirmedCurrentChapterContract(persistedWorkspace, requestedChapterId)
+      : extractConfirmedContract(persistedWorkspace, requestedChapterId);
     if (!contract) {
       throw new HttpError(409, 'WRITER_CONTRACT_REQUIRED', 'writer 只能在已保存 Workspace 中存在已确认章节契约时运行。', {
-        requiredPaths: [
-          'stages.blueprint.confirmed.selectedChapterContract',
-          'stages.blueprint.confirmed.nextChapterContractCandidate',
-          'stages.blueprint.confirmed.chapterContract',
-        ],
+        requiredPaths: usesChapterCycle
+          ? ['currentChapter.contract.confirmed']
+          : [
+              'stages.blueprint.confirmed.selectedChapterContract',
+              'stages.blueprint.confirmed.nextChapterContractCandidate',
+              'stages.blueprint.confirmed.chapterContract',
+            ],
         requiredBlueprintStatus: 'ready',
       });
     }
     const confirmedContract = prepareConfirmedContractForWriter(contract);
-    const confirmedBlueprint = prepareConfirmedBlueprintForWriter(persistedWorkspace.stages.blueprint.confirmed);
+    const confirmedBlueprint = prepareConfirmedBlueprintForWriter(
+      persistedWorkspace.stages.blueprint.confirmed,
+      { stripChapterContractCandidates: usesChapterCycle },
+    );
+    const currentChapter = {
+      number: Number(persistedWorkspace.currentChapter?.number ?? 1),
+      title: String(persistedWorkspace.currentChapter?.title ?? ''),
+    };
     payload.workspace = {
       project: cloneJson(persistedWorkspace.project),
-      currentChapter: cloneJson(persistedWorkspace.currentChapter),
+      currentChapter,
       stages: {
         idea: {
           status: persistedWorkspace.stages.idea.status,
@@ -1080,16 +1298,73 @@ function buildAiPayload(role, body, persistedWorkspace) {
         },
       },
     };
-    if (isPlainObject(payload.context?.upstream)) {
-      payload.context = cloneJson(payload.context);
-      payload.context.upstream.blueprint = confirmedBlueprint;
-    }
+    payload.context = {
+      project: cloneJson(persistedWorkspace.project),
+      currentChapter,
+      upstream: {
+        idea: cloneJson(persistedWorkspace.stages.idea.confirmed),
+        logic: cloneJson(persistedWorkspace.stages.logic.confirmed),
+        blueprint: confirmedBlueprint,
+      },
+    };
     payload.confirmedBlueprint = confirmedBlueprint;
     payload.confirmedChapterContract = confirmedContract;
     payload.contractConfirmation = {
       confirmed: true,
-      source: 'persisted_workspace_blueprint_ready',
+      source: usesChapterCycle ? 'persisted_workspace_current_chapter_contract' : 'persisted_workspace_blueprint_ready',
       blueprintStatus: persistedWorkspace.stages.blueprint.status,
+      chapterNumber: currentChapter.number,
+    };
+  }
+  if (role === 'review') {
+    const usesChapterCycle = isChapterCycleWorkspace(persistedWorkspace);
+    const requestedChapterId = body.chapterId ?? persistedWorkspace.currentChapter?.number;
+    const contract = usesChapterCycle
+      ? extractConfirmedCurrentChapterContract(persistedWorkspace, requestedChapterId)
+      : extractConfirmedContract(persistedWorkspace, requestedChapterId);
+    const confirmedDraft = persistedWorkspace.stages?.draft?.confirmed;
+    if (!contract) {
+      throw new HttpError(409, 'REVIEW_CONTRACT_REQUIRED', '审查只能基于已保存的当前章确认契约运行。');
+    }
+    if (persistedWorkspace.stages?.draft?.status !== 'ready' || confirmedDraft == null) {
+      throw new HttpError(409, 'REVIEW_DRAFT_REQUIRED', '审查只能基于作者已确认的当前章正文运行。');
+    }
+    const confirmedContract = prepareConfirmedContractForWriter(contract);
+    const confirmedBlueprint = prepareConfirmedBlueprintForWriter(
+      persistedWorkspace.stages.blueprint.confirmed,
+      { stripChapterContractCandidates: usesChapterCycle },
+    );
+    const currentChapter = {
+      number: Number(persistedWorkspace.currentChapter?.number ?? 1),
+      title: String(persistedWorkspace.currentChapter?.title ?? ''),
+    };
+    const focus = isPlainObject(input) ? String(input.focus ?? '').trim().slice(0, 20_000) : '';
+    payload.workspace = {
+      project: cloneJson(persistedWorkspace.project),
+      currentChapter,
+      stages: {
+        idea: { status: persistedWorkspace.stages.idea.status, confirmed: cloneJson(persistedWorkspace.stages.idea.confirmed) },
+        logic: { status: persistedWorkspace.stages.logic.status, confirmed: cloneJson(persistedWorkspace.stages.logic.confirmed) },
+        blueprint: { status: persistedWorkspace.stages.blueprint.status, confirmed: confirmedBlueprint },
+        draft: { status: persistedWorkspace.stages.draft.status, confirmed: cloneJson(confirmedDraft) },
+      },
+    };
+    payload.input = { focus, draft: cloneJson(confirmedDraft) };
+    payload.context = {
+      project: cloneJson(persistedWorkspace.project),
+      currentChapter,
+      upstream: {
+        idea: cloneJson(persistedWorkspace.stages.idea.confirmed),
+        logic: cloneJson(persistedWorkspace.stages.logic.confirmed),
+        blueprint: confirmedBlueprint,
+      },
+    };
+    payload.confirmedBlueprint = confirmedBlueprint;
+    payload.confirmedChapterContract = confirmedContract;
+    payload.confirmedDraft = cloneJson(confirmedDraft);
+    payload.reviewTarget = {
+      source: usesChapterCycle ? 'persisted_workspace_current_chapter' : 'persisted_workspace_confirmed_stages',
+      chapterNumber: currentChapter.number,
     };
   }
   assertSafeJson(payload, { name: 'AI payload', forbidCredentials: true });
@@ -2546,7 +2821,7 @@ app.post('/api/workspaces', async (req, res) => {
   if (constraints.length > 4000) throw new HttpError(400, 'IDEA_DRAW_CONSTRAINTS_TOO_LONG', 'Idea 抽卡方向不能超过 4000 字符。');
   const initial = defaultWorkspace();
   initial.project = { title, genre, audience, tone };
-  initial.currentChapter = { number: 1, title: '第一章' };
+  initial.currentChapter = { ...initial.currentChapter, number: 1, title: '第一章' };
   initial.stages.idea = {
     ...initial.stages.idea,
     input: ideaInput,
@@ -2575,6 +2850,7 @@ app.put('/api/workspace', async (req, res) => {
       });
     }
     const next = normalizeWorkspace(candidate, current.revision + 1);
+    validateWorkspaceTransition(current, next);
     return workspaceLibrary.saveActiveWorkspace(next);
   });
   sendJson(res, 200, { ok: true, revision: workspace.revision, workspace });

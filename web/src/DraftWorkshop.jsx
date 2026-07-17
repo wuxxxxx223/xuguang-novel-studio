@@ -2,7 +2,7 @@ import { useState } from 'react';
 import {
   AlertTriangle, CheckCircle2, CircleHelp, FileText, Sparkles,
 } from 'lucide-react';
-import { tryParseJson } from './state.js';
+import { getConfirmedCurrentChapterContract, tryParseJson } from './state.js';
 import ChapterLogicAlignment from './ChapterLogicAlignment.jsx';
 import {
   ArtifactModeToolbar, hasContent, RawDataDetails, ReadableValue,
@@ -48,7 +48,7 @@ export default function DraftWorkshop({ artifact, workspace, onSuggestionChange,
         contract={contract}
         draftText={draft}
         draftTitle={title}
-        contractLabel="蓝图中已确认的本章逻辑"
+        contractLabel="当前章已确认写作契约"
         draftLabel={readOnly ? '作者确认的小说正文' : 'AI 小说正文候选'}
       />
 
@@ -102,15 +102,5 @@ function countArray(value) {
 }
 
 function extractChapterContract(workspace) {
-  const confirmed = tryParseJson(workspace?.stages?.blueprint?.confirmed);
-  if (confirmed && typeof confirmed === 'object' && !Array.isArray(confirmed)) {
-    return confirmed.chapterContract
-      ?? confirmed.nextChapterContract
-      ?? confirmed.nextChapterContractCandidate
-      ?? confirmed.selectedChapterContract
-      ?? confirmed.selectedChapterContractCandidate
-      ?? confirmed.contract
-      ?? '';
-  }
-  return workspace?.stages?.blueprint?.input?.chapterContract ?? '';
+  return getConfirmedCurrentChapterContract(workspace) ?? '';
 }

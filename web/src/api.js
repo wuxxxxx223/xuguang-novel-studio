@@ -179,7 +179,7 @@ export function testModelConnection(settings, options = {}) {
   });
 }
 
-export function generateWithAI({ stage, workspace, input, context, refinement = null, ideation = null }) {
+export function generateWithAI({ stage, workspace, input, context, refinement = null, ideation = null, chapterId = null }) {
   return request('/api/ai/generate', {
     method: 'POST',
     body: JSON.stringify({
@@ -189,6 +189,7 @@ export function generateWithAI({ stage, workspace, input, context, refinement = 
       context,
       ...(refinement ? { refinement } : {}),
       ...(ideation ? { ideation } : {}),
+      ...(chapterId != null ? { chapterId } : {}),
     }),
   });
 }

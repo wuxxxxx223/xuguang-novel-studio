@@ -44,12 +44,30 @@ const stageDefaults = {
   review: { status: 'empty', input: { focus: '' }, suggestion: null, confirmed: null, findings: [], accepted: false },
 };
 
+const CHAPTER_CYCLE_VERSION = 1;
+const chapterContractStatuses = new Set(['unconfirmed', 'suggested', 'confirmed']);
+const chapterContractDefaults = Object.freeze({
+  status: 'unconfirmed',
+  candidate: null,
+  confirmed: null,
+  source: null,
+  proposedAt: null,
+  confirmedAt: null,
+});
+const contractMetadataKeys = new Set(['id', 'chapterId', 'chapterNumber', 'number', 'status', 'confirmed', 'source', 'candidateTitle', 'title']);
+const contractCandidateKeys = [
+  'selectedChapterContractCandidate', 'nextChapterContractCandidate', 'selectedChapterContract',
+  'nextChapterContract', 'chapterContract', 'contract',
+];
+
 export function createWorkspace() {
   return {
     revision: 0,
     project: { title: '', genre: '', audience: '', tone: '' },
     currentStage: 'idea',
-    currentChapter: { number: 1, title: '第一章' },
+    chapterCycleVersion: CHAPTER_CYCLE_VERSION,
+    chapterHistory: [],
+    currentChapter: createCurrentChapter(1),
     stages: structuredCloneSafe(stageDefaults),
     runs: [],
   };
@@ -58,6 +76,7 @@ export function createWorkspace() {
 export function normalizeWorkspace(payload) {
   const raw = payload?.workspace ?? payload?.data?.workspace ?? payload?.data ?? payload ?? {};
   const base = createWorkspace();
+  const chapterCycleVersion = Number(raw.chapterCycleVersion) === CHAPTER_CYCLE_VERSION ? CHAPTER_CYCLE_VERSION : 0;
   const stages = {};
 
   for (const stage of STAGES) {
@@ -87,10 +106,166 @@ export function normalizeWorkspace(payload) {
     revision: Number.isFinite(Number(raw.revision)) ? Number(raw.revision) : 0,
     project: { ...base.project, ...(raw.project ?? {}) },
     currentStage: STAGES.some((stage) => stage.id === raw.currentStage) ? raw.currentStage : 'idea',
-    currentChapter: { ...base.currentChapter, ...(raw.currentChapter ?? {}) },
+    chapterCycleVersion,
+    chapterHistory: Array.isArray(raw.chapterHistory) ? raw.chapterHistory.map((entry) => structuredCloneSafe(entry)) : [],
+    currentChapter: normalizeCurrentChapter(raw.currentChapter, chapterCycleVersion),
     stages,
     runs: Array.isArray(raw.runs) ? raw.runs : [],
   };
+}
+
+export function isChapterCycleWorkspace(workspace) {
+  return Number(workspace?.chapterCycleVersion) === CHAPTER_CYCLE_VERSION;
+}
+
+export function getCurrentChapterContractState(workspace) {
+  return isChapterCycleWorkspace(workspace)
+    ? normalizeChapterContract(workspace?.currentChapter?.contract)
+    : null;
+}
+
+export function getConfirmedCurrentChapterContract(workspace) {
+  if (isChapterCycleWorkspace(workspace)) {
+    const contract = getCurrentChapterContractState(workspace);
+    return contract?.status === 'confirmed' && hasContractContent(contract.confirmed)
+      ? structuredCloneSafe(contract.confirmed)
+      : null;
+  }
+  return getLegacyChapterContract(workspace?.stages?.blueprint);
+}
+
+export function hasConfirmedCurrentChapterContract(workspace) {
+  return getConfirmedCurrentChapterContract(workspace) != null;
+}
+
+export function getCurrentChapterContractCandidate(workspace) {
+  const contract = getCurrentChapterContractState(workspace);
+  return contract?.candidate == null ? null : structuredCloneSafe(contract.candidate);
+}
+
+export function canConfirmCurrentChapterContract(workspace) {
+  const contract = getCurrentChapterContractState(workspace);
+  return Boolean(contract?.status === 'suggested' && hasContractContent(contract.candidate));
+}
+
+export function prepareCurrentChapterContract(workspace, timestamp = new Date().toISOString()) {
+  if (!isChapterCycleWorkspace(workspace)) return workspace;
+  const currentChapter = normalizeCurrentChapter(workspace.currentChapter, CHAPTER_CYCLE_VERSION);
+  const currentContract = currentChapter.contract;
+  if (currentContract.status === 'confirmed' || currentContract.candidate != null) return workspace;
+
+  const candidateSource = findBlueprintContractCandidate(workspace, currentChapter.number);
+  const candidate = candidateSource?.value ?? createContractTemplate(currentChapter.number);
+  return {
+    ...workspace,
+    currentChapter: {
+      ...currentChapter,
+      contract: {
+        status: 'suggested',
+        candidate: structuredCloneSafe(candidate),
+        confirmed: null,
+        source: candidateSource?.source ?? { kind: 'author-contract-template', targetChapterNumber: currentChapter.number },
+        proposedAt: timestamp,
+        confirmedAt: null,
+      },
+    },
+  };
+}
+
+export function updateCurrentChapterContractCandidate(workspace, candidate, timestamp = new Date().toISOString()) {
+  if (!isChapterCycleWorkspace(workspace)) return workspace;
+  const currentChapter = normalizeCurrentChapter(workspace.currentChapter, CHAPTER_CYCLE_VERSION);
+  if (currentChapter.contract.status === 'confirmed') return workspace;
+  return {
+    ...workspace,
+    currentChapter: {
+      ...currentChapter,
+      contract: {
+        ...currentChapter.contract,
+        status: 'suggested',
+        candidate: structuredCloneSafe(candidate),
+        confirmed: null,
+        source: currentChapter.contract.source ?? { kind: 'author-edited-contract', targetChapterNumber: currentChapter.number },
+        proposedAt: currentChapter.contract.proposedAt ?? timestamp,
+        confirmedAt: null,
+      },
+    },
+  };
+}
+
+export function confirmCurrentChapterContract(workspace, timestamp = new Date().toISOString()) {
+  if (!canConfirmCurrentChapterContract(workspace)) return null;
+  const currentChapter = normalizeCurrentChapter(workspace.currentChapter, CHAPTER_CYCLE_VERSION);
+  const confirmed = structuredCloneSafe(currentChapter.contract.candidate);
+  return {
+    ...workspace,
+    currentChapter: {
+      ...currentChapter,
+      title: chapterTitleFromContract(confirmed, currentChapter.number),
+      contract: {
+        ...currentChapter.contract,
+        status: 'confirmed',
+        confirmed,
+        confirmedAt: timestamp,
+      },
+    },
+  };
+}
+
+export function canCompleteCurrentChapter(workspace) {
+  const draft = workspace?.stages?.draft;
+  const review = workspace?.stages?.review;
+  const chapterNumber = Number(workspace?.currentChapter?.number ?? 0);
+  const history = Array.isArray(workspace?.chapterHistory) ? workspace.chapterHistory : [];
+  return Boolean(
+    chapterNumber > 0
+    && getConfirmedCurrentChapterContract(workspace) != null
+    && draft?.status === 'ready'
+    && draft.confirmed != null
+    && review?.status === 'ready'
+    && review.confirmed != null
+    && review.accepted === true
+    && !history.some((entry) => Number(entry?.chapterNumber) === chapterNumber),
+  );
+}
+
+export function prepareNextWorkspaceChapter(workspace, timestamp = new Date().toISOString()) {
+  if (!canCompleteCurrentChapter(workspace)) return null;
+  const currentChapter = normalizeCurrentChapter(workspace.currentChapter, isChapterCycleWorkspace(workspace) ? CHAPTER_CYCLE_VERSION : 0);
+  const contract = getConfirmedCurrentChapterContract(workspace);
+  const completed = {
+    schemaVersion: 1,
+    chapterNumber: currentChapter.number,
+    title: currentChapter.title || chapterTitleFromContract(contract, currentChapter.number),
+    contract: {
+      value: structuredCloneSafe(contract),
+      confirmedAt: currentChapter.contract?.confirmedAt ?? workspace.stages.blueprint?.confirmedAt ?? null,
+    },
+    draft: {
+      value: structuredCloneSafe(workspace.stages.draft.confirmed),
+      confirmedAt: workspace.stages.draft.confirmedAt ?? null,
+    },
+    review: {
+      value: structuredCloneSafe(workspace.stages.review.confirmed),
+      confirmedAt: workspace.stages.review.confirmedAt ?? null,
+    },
+    completedAt: timestamp,
+    formalWritePerformed: false,
+  };
+  const nextNumber = currentChapter.number + 1;
+  const next = {
+    ...workspace,
+    chapterCycleVersion: CHAPTER_CYCLE_VERSION,
+    chapterHistory: [...(Array.isArray(workspace.chapterHistory) ? workspace.chapterHistory : []), completed],
+    currentStage: 'blueprint',
+    currentChapter: createCurrentChapter(nextNumber),
+    stages: {
+      ...workspace.stages,
+      draft: structuredCloneSafe(stageDefaults.draft),
+      review: structuredCloneSafe(stageDefaults.review),
+    },
+  };
+  return prepareCurrentChapterContract(next, timestamp);
 }
 
 export function createSettings() {
@@ -221,6 +396,11 @@ export function hasArtifactContent(artifact) {
 export function canAccessStage(workspace, stageId) {
   const index = getStageIndex(stageId);
   if (index === 0) return { allowed: true, reason: '' };
+
+  if (stageId === 'draft' && isChapterCycleWorkspace(workspace) && !hasConfirmedCurrentChapterContract(workspace)) {
+    const number = workspace?.currentChapter?.number ?? 1;
+    return { allowed: false, reason: `先确认第 ${number} 章章节契约` };
+  }
 
   const artifact = workspace.stages?.[stageId];
   if (artifact?.status !== 'empty' || hasArtifactContent(artifact)) {
@@ -355,16 +535,179 @@ export function countRisks(workspace, settings) {
   count += STAGES.filter((stage) => !getModelRoute(settings, stage.modelKey).configured).length;
   count += STAGES.filter((stage) => workspace.stages[stage.id]?.status === 'stale').length;
   count += STAGES.filter((stage) => workspace.stages[stage.id]?.status === 'error').length;
+  if (isChapterCycleWorkspace(workspace) && workspace.stages.blueprint?.status === 'ready' && !hasConfirmedCurrentChapterContract(workspace)) count += 1;
   const blockers = workspace.stages.review?.findings?.filter((finding) => ['P0', 'P1'].includes(String(finding?.severity ?? finding?.priority ?? '').toUpperCase()));
   count += blockers?.length ?? 0;
   return count;
 }
 
 export function firstActionableStage(workspace) {
+  if (isChapterCycleWorkspace(workspace) && !hasConfirmedCurrentChapterContract(workspace)) {
+    return getStage('blueprint');
+  }
+  if (canCompleteCurrentChapter(workspace)) return getStage('review');
+
   const current = getStage(workspace.currentStage);
   if (canAccessStage(workspace, current.id).allowed && workspace.stages[current.id]?.status !== 'ready') return current;
   const nextIncomplete = STAGES.find((stage) => canAccessStage(workspace, stage.id).allowed && workspace.stages[stage.id]?.status !== 'ready');
   return nextIncomplete ?? STAGES[STAGES.length - 1];
+}
+
+function createCurrentChapter(number) {
+  const chapterNumber = Number.isInteger(Number(number)) && Number(number) > 0 ? Number(number) : 1;
+  return {
+    number: chapterNumber,
+    title: `第 ${chapterNumber} 章`,
+    contract: structuredCloneSafe(chapterContractDefaults),
+  };
+}
+
+function normalizeCurrentChapter(value, chapterCycleVersion) {
+  const incoming = isPlainObject(value) ? value : {};
+  const fallback = createCurrentChapter(incoming.number);
+  const title = String(incoming.title ?? fallback.title).trim().slice(0, 200) || fallback.title;
+  return {
+    ...fallback,
+    ...incoming,
+    number: fallback.number,
+    title,
+    contract: normalizeChapterContract(incoming.contract, chapterCycleVersion),
+  };
+}
+
+function normalizeChapterContract(value) {
+  const incoming = isPlainObject(value) ? value : {};
+  const candidate = incoming.candidate ?? null;
+  const confirmed = incoming.confirmed ?? null;
+  let status = chapterContractStatuses.has(incoming.status) ? incoming.status : 'unconfirmed';
+  if (status === 'confirmed' && !hasContractContent(confirmed)) status = hasContractContent(candidate) ? 'suggested' : 'unconfirmed';
+  if (status === 'suggested' && candidate == null) status = 'unconfirmed';
+  return {
+    ...chapterContractDefaults,
+    ...incoming,
+    status,
+    candidate: candidate == null ? null : structuredCloneSafe(candidate),
+    confirmed: status === 'confirmed' ? structuredCloneSafe(confirmed) : null,
+    source: incoming.source == null ? null : structuredCloneSafe(incoming.source),
+    proposedAt: incoming.proposedAt ?? null,
+    confirmedAt: status === 'confirmed' ? incoming.confirmedAt ?? null : null,
+  };
+}
+
+function getLegacyChapterContract(blueprintArtifact) {
+  const confirmed = tryParseJson(blueprintArtifact?.confirmed);
+  if (isPlainObject(confirmed)) {
+    const contract = confirmed.chapterContract
+      ?? confirmed.nextChapterContract
+      ?? confirmed.nextChapterContractCandidate
+      ?? confirmed.selectedChapterContract
+      ?? confirmed.selectedChapterContractCandidate
+      ?? confirmed.contract
+      ?? null;
+    if (hasContractContent(contract)) return structuredCloneSafe(contract);
+  }
+  const inputContract = blueprintArtifact?.input?.chapterContract;
+  return hasContractContent(inputContract) ? structuredCloneSafe(inputContract) : null;
+}
+
+function hasContractContent(value) {
+  if (typeof value === 'string') return Boolean(value.trim());
+  if (!isPlainObject(value)) return Array.isArray(value) ? value.some(hasContractContent) : false;
+  return Object.entries(value).some(([key, item]) => !contractMetadataKeys.has(key) && hasValue(item));
+}
+
+function chapterTitleFromContract(contract, chapterNumber) {
+  if (isPlainObject(contract)) {
+    const title = String(contract.candidateTitle ?? contract.title ?? '').trim();
+    if (title) return title.slice(0, 200);
+  }
+  return `第 ${chapterNumber} 章`;
+}
+
+function createContractTemplate(chapterNumber) {
+  return {
+    chapterNumber,
+    candidateTitle: `第 ${chapterNumber} 章`,
+    chapterGoal: '',
+    coreConflict: '',
+    chapterEndHook: '',
+    candidateBeatSequence: [],
+  };
+}
+
+function findBlueprintContractCandidate(workspace, targetChapterNumber) {
+  const blueprint = workspace?.stages?.blueprint;
+  if (blueprint?.status !== 'ready') return null;
+  const root = tryParseJson(blueprint.confirmed);
+  if (!isPlainObject(root)) return null;
+  const exact = [];
+  const unspecified = [];
+  const seen = new Set();
+
+  const add = (value, sourcePath) => {
+    if (!hasContractContent(value) || seen.has(value)) return;
+    seen.add(value);
+    const sourceChapterNumber = contractChapterNumber(value);
+    const item = {
+      value: structuredCloneSafe(value),
+      source: {
+        kind: 'blueprint-next-contract-candidate',
+        sourcePath,
+        targetChapterNumber,
+        sourceChapterNumber,
+        blueprintConfirmedAt: blueprint.confirmedAt ?? null,
+      },
+    };
+    if (sourceChapterNumber === targetChapterNumber) exact.push(item);
+    else if (sourceChapterNumber == null) unspecified.push(item);
+  };
+
+  const visit = (value, sourcePath, depth = 0) => {
+    if (!isPlainObject(value) || depth > 4) return;
+    if (looksLikeChapterContract(value)) add(value, sourcePath);
+    for (const key of contractCandidateKeys) {
+      if (value[key] != null) add(value[key], `${sourcePath}.${key}`);
+    }
+    for (const key of ['chapterContracts', 'chapters']) {
+      if (!Array.isArray(value[key])) continue;
+      value[key].forEach((item, index) => add(item, `${sourcePath}.${key}[${index}]`));
+    }
+    Object.entries(value).forEach(([key, child]) => {
+      if (isPlainObject(child)) visit(child, `${sourcePath}.${key}`, depth + 1);
+    });
+  };
+
+  visit(root, 'stages.blueprint.confirmed');
+  const alreadyUsed = (candidate) => {
+    const history = Array.isArray(workspace?.chapterHistory) ? workspace.chapterHistory : [];
+    const used = history.map((entry) => entry?.contract?.value).filter(Boolean);
+    const current = getConfirmedCurrentChapterContract(workspace);
+    if (current) used.push(current);
+    return used.some((value) => sameJsonValue(value, candidate.value));
+  };
+  return exact.find((candidate) => !alreadyUsed(candidate)) ?? unspecified.find((candidate) => !alreadyUsed(candidate)) ?? null;
+}
+
+function looksLikeChapterContract(value) {
+  return isPlainObject(value) && [
+    'chapterId', 'chapterNumber', 'candidateTitle', 'title', 'chapterGoal', 'goal',
+    'coreConflict', 'chapterEndHook', 'endHook', 'hook', 'requiredBeats', 'mustInclude',
+  ].some((key) => Object.hasOwn(value, key));
+}
+
+function contractChapterNumber(value) {
+  if (!isPlainObject(value)) return null;
+  const raw = value.chapterNumber ?? value.chapterId ?? value.number ?? value.id;
+  const number = Number(raw);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function sameJsonValue(first, second) {
+  return JSON.stringify(first) === JSON.stringify(second);
 }
 
 function hasValue(value) {

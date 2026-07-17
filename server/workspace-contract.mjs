@@ -134,14 +134,52 @@ export function extractConfirmedContract(workspace, requestedChapterId) {
   return cloneJson(contract);
 }
 
+export function isChapterCycleWorkspace(workspace) {
+  return Number(workspace?.chapterCycleVersion) === 1;
+}
+
+export function extractConfirmedCurrentChapterContract(workspace, requestedChapterId) {
+  if (!isChapterCycleWorkspace(workspace)) return null;
+  const currentChapter = workspace?.currentChapter;
+  const currentNumber = Number(currentChapter?.number);
+  if (!Number.isInteger(currentNumber) || currentNumber < 1) return null;
+  if (requestedChapterId != null && String(requestedChapterId) !== String(currentNumber)) return null;
+
+  const state = currentChapter?.contract;
+  if (!isPlainObject(state) || state.status !== 'confirmed' || !hasContractValue(state.confirmed)) return null;
+  const contract = state.confirmed;
+  if (isPlainObject(contract)) {
+    const rawChapterNumber = contract.chapterId ?? contract.chapterNumber ?? contract.number
+      ?? (typeof contract.id === 'number' || /^\d+$/.test(String(contract.id ?? '')) ? contract.id : null);
+    const contractNumber = Number(rawChapterNumber);
+    if (rawChapterNumber != null && (!Number.isInteger(contractNumber) || contractNumber !== currentNumber)) return null;
+  }
+  return cloneJson(contract);
+}
+
 export function prepareConfirmedContractForWriter(contract) {
   if (typeof contract === 'string') return contract.trim();
   if (!isPlainObject(contract)) return contract;
   return markConfirmedContracts(cloneJson(contract));
 }
 
-export function prepareConfirmedBlueprintForWriter(confirmedBlueprint) {
+export function prepareConfirmedBlueprintForWriter(confirmedBlueprint, { stripChapterContractCandidates = false } = {}) {
   const parsed = parseObject(confirmedBlueprint);
   if (!parsed) return confirmedBlueprint;
+  if (stripChapterContractCandidates) return stripChapterContractCandidatesForWriter(parsed);
   return markConfirmedContracts(cloneJson(parsed));
+}
+
+function stripChapterContractCandidatesForWriter(value) {
+  if (Array.isArray(value)) return value.map(stripChapterContractCandidatesForWriter);
+  if (!isPlainObject(value)) return value;
+  const chapterContractKeys = new Set([
+    'selectedChapterContract', 'selectedChapterContractCandidate', 'nextChapterContract',
+    'nextChapterContractCandidate', 'chapterContract', 'contract', 'chapterContracts', 'chapters',
+  ]);
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !chapterContractKeys.has(key))
+      .map(([key, child]) => [key, stripChapterContractCandidatesForWriter(child)]),
+  );
 }

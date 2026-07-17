@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import {
   extractConfirmedContract,
+  extractConfirmedCurrentChapterContract,
+  isChapterCycleWorkspace,
   prepareConfirmedBlueprintForWriter,
   prepareConfirmedContractForWriter,
 } from './workspace-contract.mjs';
@@ -125,5 +127,49 @@ const writerBlueprint = prepareConfirmedBlueprintForWriter({
 assert.equal(writerBlueprint.nextChapterContractCandidate.status, 'confirmed');
 assert.equal(writerBlueprint.nextChapterContractCandidate.confirmed, true);
 assert.equal(writerBlueprint.positioning.genre, '仙侠');
+
+const cycleContract = {
+  chapterNumber: 2,
+  candidateTitle: '雨夜的试探',
+  chapterGoal: '主角在雨夜逼出盟友的真实立场',
+  coreConflict: '盟友可能已经倒向敌人',
+  chapterEndHook: '密信上的日期指向明天的处刑',
+};
+const cycleWorkspace = {
+  chapterCycleVersion: 1,
+  currentChapter: {
+    number: 2,
+    title: '雨夜的试探',
+    contract: { status: 'suggested', candidate: cycleContract, confirmed: null },
+  },
+  stages: {
+    blueprint: {
+      status: 'ready',
+      confirmed: { positioning: { genre: '悬疑' }, nextChapterContractCandidate: candidateContract },
+    },
+  },
+};
+assert.equal(isChapterCycleWorkspace(cycleWorkspace), true, '连续写作 Workspace 必须显式使用新版章节循环');
+assert.equal(
+  extractConfirmedCurrentChapterContract(cycleWorkspace, 2),
+  null,
+  '当前章候选即使来自已确认蓝图，也不能在作者单独确认前供 writer 使用',
+);
+cycleWorkspace.currentChapter.contract = { status: 'confirmed', candidate: cycleContract, confirmed: cycleContract };
+assert.deepEqual(
+  extractConfirmedCurrentChapterContract(cycleWorkspace, 2),
+  cycleContract,
+  '新版 writer 只能读取当前章节已确认契约快照',
+);
+assert.equal(
+  extractConfirmedCurrentChapterContract(cycleWorkspace, 3),
+  null,
+  '新版 writer 不能借当前章契约跨章写作',
+);
+const strippedCycleBlueprint = prepareConfirmedBlueprintForWriter(cycleWorkspace.stages.blueprint.confirmed, {
+  stripChapterContractCandidates: true,
+});
+assert.equal(strippedCycleBlueprint.nextChapterContractCandidate, undefined, '新版 writer 上下文不能把蓝图候选当作已确认章节事实');
+assert.equal(strippedCycleBlueprint.positioning.genre, '悬疑');
 
 console.log('workspace contract smoke passed');

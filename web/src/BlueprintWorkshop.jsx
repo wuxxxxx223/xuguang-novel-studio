@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import {
-  CheckCircle2, ChevronDown, CircleHelp, Flag, GitBranch, ListChecks,
+  BookOpenText, Check, CheckCircle2, ChevronDown, CircleHelp, Flag, GitBranch, ListChecks,
   Network, PanelsTopLeft, Sparkles, Target, UsersRound,
 } from 'lucide-react';
 import { tryParseJson } from './state.js';
@@ -17,7 +17,11 @@ const SECTION_DEFINITIONS = [
   { id: 'gaps', label: '待作者裁决', description: '这些候选决定会改变后续角色、卷纲或章节写法。', icon: CircleHelp, tone: 'decision' },
 ];
 
-export default function BlueprintWorkshop({ artifact, onSuggestionChange, readOnly = false }) {
+export default function BlueprintWorkshop({
+  artifact, onSuggestionChange, readOnly = false,
+  currentChapter = null, chapterHistory = [], chapterCycleEnabled = false,
+  onCurrentChapterContractChange, onConfirmCurrentChapterContract,
+}) {
   const [viewMode, setViewMode] = useState('read');
   const [expandedSections, setExpandedSections] = useState(() => new Set(['contract']));
   const suggestion = tryParseJson(artifact.suggestion);
@@ -27,6 +31,13 @@ export default function BlueprintWorkshop({ artifact, onSuggestionChange, readOn
   const relationships = arrayValue(suggestion?.relationships);
   const volumes = arrayValue(suggestion?.volumes);
   const contract = suggestion?.nextChapterContractCandidate;
+  const currentContract = chapterCycleEnabled ? currentChapter?.contract ?? null : null;
+  const currentContractValue = currentContract?.status === 'confirmed' ? currentContract.confirmed : currentContract?.candidate;
+  const currentContractConfirmed = currentContract?.status === 'confirmed';
+  const currentContractSource = currentContract?.source?.kind === 'blueprint-next-contract-candidate'
+    ? '来自已确认蓝图的候选，仍需你单独确认。'
+    : '这是当前章节的作者可编辑契约草稿，确认后才会解锁正文。';
+  const completedChapters = Array.isArray(chapterHistory) ? chapterHistory : [];
   const gaps = arrayValue(suggestion?.gaps);
   const names = useMemo(() => buildCharacterNames(characters), [characters]);
   const sections = SECTION_DEFINITIONS.filter((section) => {
@@ -163,6 +174,73 @@ export default function BlueprintWorkshop({ artifact, onSuggestionChange, readOn
         <StructureEditingPane>
           <StructuredArtifactEditor value={suggestion} onChange={onSuggestionChange} disabled={busy || readOnly} />
         </StructureEditingPane>
+      )}
+
+      {chapterCycleEnabled && (
+        <section className="paper-card workspace-chapter-contract-card">
+          <div className="card-heading-row compact">
+            <div className={`section-icon ${currentContractConfirmed ? 'green' : 'coral'}`}>
+              {currentContractConfirmed ? <CheckCircle2 size={19} /> : <ListChecks size={19} />}
+            </div>
+            <div>
+              <span className="section-kicker">当前章契约 · CH {String(currentChapter?.number ?? 1).padStart(2, '0')}</span>
+              <h2>{currentContractConfirmed ? '作者已确认当前章写作契约' : '先确认本章契约，再进入正文写作'}</h2>
+              <p>{currentContractConfirmed ? 'Writer 只会读取这份当前章确认稿；蓝图中的其他章节候选不会被直接当作事实。' : currentContractSource}</p>
+            </div>
+          </div>
+          {currentContractValue != null ? (
+            <div className="workspace-chapter-contract-body">
+              {typeof currentContractValue === 'object' && !Array.isArray(currentContractValue)
+                ? <ChapterContract contract={currentContractValue} />
+                : <ReadableValue value={currentContractValue} />}
+              {!currentContractConfirmed && (
+                <details className="workspace-chapter-contract-editor">
+                  <summary>核对或编辑第 {currentChapter?.number ?? 1} 章契约<ChevronDown size={15} /></summary>
+                  <p>这里的修改仍是待确认草稿，不会改写已确认蓝图，也不会进入正式正文项目。</p>
+                  <StructuredArtifactEditor
+                    value={currentContractValue}
+                    onChange={(value) => onCurrentChapterContractChange?.(value)}
+                    disabled={busy || !onCurrentChapterContractChange}
+                  />
+                </details>
+              )}
+            </div>
+          ) : <p className="artifact-empty">当前章还没有可确认的契约。请在蓝图结构中补写下一章契约后再确认。</p>}
+          {!currentContractConfirmed && (
+            <div className="workspace-chapter-contract-actions">
+              <div><Flag size={15} /><span>确认后，它才成为第 {currentChapter?.number ?? 1} 章的写作事实。</span></div>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={onConfirmCurrentChapterContract}
+                disabled={busy || !currentContractValue || !onConfirmCurrentChapterContract}
+              >
+                <Check size={17} />确认作为第 {currentChapter?.number ?? 1} 章契约
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {chapterCycleEnabled && completedChapters.length > 0 && (
+        <section className="paper-card workspace-chapter-history-card">
+          <div className="card-heading-row compact">
+            <div className="section-icon green"><BookOpenText size={19} /></div>
+            <div><span className="section-kicker">Workspace 章节历史</span><h2>已确认章节保持只读归档</h2><p>这些记录只留在创作 Workspace，不会自动生成或覆盖正式正文文件。</p></div>
+          </div>
+          <div className="workspace-chapter-history-list">
+            {completedChapters.map((chapter) => (
+              <details key={chapter.chapterNumber}>
+                <summary><span>CH {String(chapter.chapterNumber).padStart(2, '0')}</span><strong>{chapter.title || `第 ${chapter.chapterNumber} 章`}</strong><small>{chapter.completedAt ? '已归档' : '历史记录'}</small><ChevronDown size={15} /></summary>
+                <div className="workspace-chapter-history-detail">
+                  <section><h3>确认契约</h3><ReadableValue value={chapter.contract?.value} /></section>
+                  <section><h3>确认正文</h3><ReadableValue value={chapter.draft?.value} /></section>
+                  <section><h3>审查结论</h3><ReadableValue value={chapter.review?.value} /></section>
+                </div>
+              </details>
+            ))}
+          </div>
+        </section>
       )}
 
       <RawDataDetails value={suggestion} label="高级：查看蓝图原始结构" />

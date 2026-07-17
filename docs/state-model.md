@@ -566,6 +566,58 @@ continuation/* -> origin/today              [选择“开书重建”]
 - 开书流程的当前章永远从第 1 章开始，除非作者在该 Workspace 内完成并推进章节。
 - 模式切换不改变正式事实、候选稿、审查 Finding 或 checkpoint。
 
+### v1.1：Origin 连续章节状态
+
+```json
+{
+  "chapterCycleVersion": 1,
+  "currentChapter": {
+    "number": 2,
+    "title": "第二章",
+    "contract": {
+      "status": "unconfirmed | suggested | confirmed",
+      "candidate": {},
+      "confirmed": null,
+      "source": { "kind": "blueprint-next-contract-candidate | author-contract-template" },
+      "proposedAt": "ISO-8601",
+      "confirmedAt": null
+    }
+  },
+  "chapterHistory": [
+    {
+      "chapterNumber": 1,
+      "contract": { "value": {}, "confirmedAt": "ISO-8601" },
+      "draft": { "value": "作者确认正文", "confirmedAt": "ISO-8601" },
+      "review": { "value": {}, "confirmedAt": "ISO-8601" },
+      "completedAt": "ISO-8601",
+      "formalWritePerformed": false
+    }
+  ]
+}
+```
+
+### 迁移
+
+```text
+blueprint ready
+  -> currentChapter.contract suggested
+  -> confirmed                         [作者明确确认契约]
+draft ready + review ready + accepted
+  -> append chapterHistory
+  -> currentChapter.number + 1
+  -> reset draft/review
+  -> next currentChapter.contract suggested | unconfirmed
+```
+
+### 不变量
+
+- `chapterCycleVersion = 1` 时，writer 只接受 `currentChapter.contract.confirmed`，章节号必须与 `currentChapter.number` 一致。
+- 蓝图中的章节候选复制到 `candidate` 后仍是建议，不得因蓝图已确认而自动提升到 `confirmed`。
+- `chapterHistory` 只能追加；已归档条目必须逐字保留确认契约、正文和审查快照，不能删除、重排或覆盖。
+- 归档要求当前章契约、正文和审查均为 `ready`，且审查 `accepted = true`；推进下一章时不得携带上一章 draft/review 运行态。
+- 缺少 `chapterCycleVersion` 的历史 Workspace 视为兼容 v0；保留蓝图契约 writer 路径，直到完成当前章的合法迁移。
+- 连续章节不创建 Project、checkpoint 或正式正文文件；正式写回仍只存在于 continuation 路径。
+
 ---
 
 ## v1.0：IdeaIteration 状态模型

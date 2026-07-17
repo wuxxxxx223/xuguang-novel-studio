@@ -3,7 +3,7 @@ import {
   ArrowRight, BarChart3, CheckCircle2, Quote, ScanSearch, ShieldAlert,
   Sparkles, ThumbsUp,
 } from 'lucide-react';
-import { tryParseJson } from './state.js';
+import { getConfirmedCurrentChapterContract, tryParseJson } from './state.js';
 import ChapterLogicAlignment from './ChapterLogicAlignment.jsx';
 import {
   ArtifactModeToolbar, firstText, hasContent, RawDataDetails, ReadableValue,
@@ -216,17 +216,7 @@ function severityOrder(value) {
 }
 
 function extractChapterContract(workspace) {
-  const confirmed = tryParseJson(workspace?.stages?.blueprint?.confirmed);
-  if (confirmed && typeof confirmed === 'object' && !Array.isArray(confirmed)) {
-    return confirmed.chapterContract
-      ?? confirmed.nextChapterContract
-      ?? confirmed.nextChapterContractCandidate
-      ?? confirmed.selectedChapterContract
-      ?? confirmed.selectedChapterContractCandidate
-      ?? confirmed.contract
-      ?? '';
-  }
-  return workspace?.stages?.blueprint?.input?.chapterContract ?? '';
+  return getConfirmedCurrentChapterContract(workspace) ?? '';
 }
 
 function extractDraft(value) {

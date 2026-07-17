@@ -15,11 +15,14 @@ import {
   saveSettings, saveWorkspace, testModelConnection,
 } from './api.js';
 import {
-  STAGES, STATUS_META, canAccessStage, countRisks, createSettings,
-  createWorkspace, editStage, extractFindings, extractSuggestion,
-  firstActionableStage, getModelRoute, getNextStage, getPreviousStage, getStage,
-  getStageIndex, humanizeKey, markDownstreamStale, normalizeSettings, normalizeWorkspace,
-  summarizeArtifact, tryParseJson, valueToText,
+  STAGES, STATUS_META, canAccessStage, canCompleteCurrentChapter, canConfirmCurrentChapterContract,
+  confirmCurrentChapterContract as confirmCurrentChapterContractState, countRisks, createSettings,
+  createWorkspace, editStage, extractFindings, extractSuggestion, firstActionableStage,
+  getConfirmedCurrentChapterContract, getCurrentChapterContractCandidate, getModelRoute, getNextStage,
+  getPreviousStage, getStage, getStageIndex, hasConfirmedCurrentChapterContract, humanizeKey,
+  isChapterCycleWorkspace, markDownstreamStale, normalizeSettings, normalizeWorkspace,
+  prepareCurrentChapterContract, prepareNextWorkspaceChapter, summarizeArtifact, tryParseJson,
+  updateCurrentChapterContractCandidate, valueToText,
 } from './state.js';
 import { ProjectChapterWorkspace, ProjectContractWorkspace, ProjectInspector, ProjectModelLab, ProjectReviewWorkspace, ProjectTodayWorkspace, ProjectWriteBackWorkspace } from './ProjectDashboard.jsx';
 import IdeaDrawPanel from './IdeaDrawPanel.jsx';
@@ -145,6 +148,7 @@ export default function App() {
   const activeProjectIdRef = useRef(activeProjectId);
   const projectRequestEpochRef = useRef(0);
   const generationEpochRef = useRef(0);
+  const chapterCycleBusyRef = useRef(false);
 
   const notify = useCallback((message, tone = 'neutral') => {
     clearTimeout(toastTimerRef.current);
@@ -196,6 +200,7 @@ export default function App() {
   }, []);
 
   const updateWorkspace = useCallback((updater) => {
+    if (chapterCycleBusyRef.current) return;
     localVersionRef.current += 1;
     setWorkspace((current) => (typeof updater === 'function' ? updater(current) : updater));
   }, []);
@@ -363,6 +368,10 @@ export default function App() {
   }, []);
 
   const goToLibrary = useCallback(async () => {
+    if (chapterCycleBusyRef.current) {
+      notify('当前正在归档章节，请完成后再返回作品主界面', 'warning');
+      return;
+    }
     if (projectChapterBusy) {
       notify('当前章节操作仍在执行，请完成后再返回主界面', 'warning');
       return;
@@ -390,6 +399,10 @@ export default function App() {
 
   const openWorkspaceRecord = useCallback(async (workspaceId) => {
     if (!workspaceId || workspaceLibraryBusy) return;
+    if (chapterCycleBusyRef.current) {
+      notify('当前正在归档章节，请完成后再切换作品', 'warning');
+      return;
+    }
     if (projectChapterBusy) {
       notify('当前章节操作仍在执行，请完成后再切换作品', 'warning');
       return;
@@ -526,6 +539,10 @@ export default function App() {
   }, [activeProjectId, confirmProjectLeave, notify, projectChapterBusy, projectDashboard]);
 
   const navigate = useCallback((target) => {
+    if (chapterCycleBusyRef.current) {
+      notify('当前正在保存章节状态，请完成后再切换页面', 'warning');
+      return;
+    }
     setProjectOpen(false);
     setCommandOpen(false);
     if (target === 'today') {
@@ -659,6 +676,10 @@ export default function App() {
       notify(`请先确认${missingUpstream.label}，当前阶段不能基于旧上游生成`, 'warning');
       return;
     }
+    if (stageId === 'draft' && isChapterCycleWorkspace(workspace) && !hasConfirmedCurrentChapterContract(workspace)) {
+      notify(`请先确认第 ${workspace.currentChapter?.number ?? 1} 章章节契约；蓝图候选不会自动成为写作事实`, 'warning');
+      return;
+    }
 
     const isIdeaRefinement = stageId === 'idea' && options.mode === 'iterate';
     const isIdeaDraw = stageId === 'idea' && options.mode === 'draw';
@@ -730,6 +751,7 @@ export default function App() {
         context: buildGenerationContext(snapshot, stageId),
         refinement,
         ideation,
+        chapterId: ['draft', 'review'].includes(stageId) ? snapshot.currentChapter?.number ?? 1 : null,
       });
       if (generationEpoch !== generationEpochRef.current) return;
       if (generationSignature !== buildGenerationSignature(workspaceRef.current, stageId)) {
@@ -807,13 +829,14 @@ export default function App() {
 
   const confirmSuggestion = useCallback((stageId) => {
     const artifact = workspace.stages[stageId];
-    if (artifact.suggestion == null) {
-      notify('当前没有可确认的建议稿', 'warning');
+    const authorDraft = stageId === 'draft' ? getDraftBody(artifact.text) : '';
+    if (artifact.suggestion == null && !authorDraft.trim()) {
+      notify('当前没有可确认的建议稿或作者正文', 'warning');
       return;
     }
     updateWorkspace((current) => {
       const currentArtifact = current.stages[stageId];
-      const confirmed = cloneValue(currentArtifact.suggestion);
+      const confirmed = cloneValue(currentArtifact.suggestion ?? (stageId === 'draft' ? getDraftBody(currentArtifact.text) : null));
       const confirmedChanged = currentArtifact.confirmed != null && !sameJsonValue(currentArtifact.confirmed, confirmed);
       const findings = extractFindings({}, confirmed);
       const ideaIterations = stageId === 'idea' ? prepareIdeaIterations(currentArtifact) : null;
@@ -829,10 +852,73 @@ export default function App() {
           },
         },
       };
-      return confirmedChanged ? markDownstreamStale(next, stageId) : next;
+      const nextWithStaleState = confirmedChanged ? markDownstreamStale(next, stageId) : next;
+      return stageId === 'blueprint' ? prepareCurrentChapterContract(nextWithStaleState) : nextWithStaleState;
     });
-    notify(stageId === 'idea' ? '当前 Idea 已由你定稿，故事引擎现已解锁' : '已写入作者确认稿，下游阶段现已可继续', 'success');
+    notify(stageId === 'idea' ? '当前 Idea 已由你定稿，故事引擎现已解锁' : stageId === 'blueprint' ? '蓝图已确认；请再核对并确认当前章契约后开始写作' : stageId === 'draft' && artifact.suggestion == null ? '作者正文已由你确认；现在可以进入只读审查' : '已写入作者确认稿，下游阶段现已可继续', 'success');
   }, [notify, updateWorkspace, workspace]);
+
+  const changeCurrentChapterContract = useCallback((candidate) => {
+    updateWorkspace((current) => updateCurrentChapterContractCandidate(current, candidate));
+  }, [updateWorkspace]);
+
+  const confirmCurrentChapterContract = useCallback(async () => {
+    if (chapterCycleBusyRef.current) return;
+    const candidateWorkspace = workspaceRef.current;
+    const next = confirmCurrentChapterContractState(candidateWorkspace);
+    if (!next) {
+      notify('请先补齐当前章的核心目标、冲突或章末钩子，再确认章节契约', 'warning');
+      return;
+    }
+    chapterCycleBusyRef.current = true;
+    setSaveState({ status: 'saving', message: '正在保存候选并确认章节契约…' });
+    try {
+      const candidateSaved = await persistWorkspace(candidateWorkspace, false);
+      if (!candidateSaved) {
+        notify('当前章契约候选尚未保存；请恢复连接后重试确认', 'error');
+        return;
+      }
+      const confirmedSaved = await persistWorkspace(next, false);
+      if (!confirmedSaved) {
+        notify('当前章契约候选已保存，但确认尚未完成；请重试确认', 'error');
+        return;
+      }
+      const persisted = { ...next, revision: serverRevisionRef.current };
+      workspaceRef.current = persisted;
+      setWorkspace(persisted);
+      notify(`第 ${next.currentChapter.number} 章契约已由你确认；现在可以进入章节写作`, 'success');
+    } finally {
+      chapterCycleBusyRef.current = false;
+    }
+  }, [notify, persistWorkspace]);
+
+  const completeCurrentChapter = useCallback(async () => {
+    if (chapterCycleBusyRef.current) return;
+    const next = prepareNextWorkspaceChapter(workspaceRef.current);
+    if (!next) {
+      notify('请先确认当前章契约、正文与审查结论，再准备下一章', 'warning');
+      return;
+    }
+    chapterCycleBusyRef.current = true;
+    localVersionRef.current += 1;
+    setSaveState({ status: 'saving', message: '正在归档本章并准备下一章…' });
+    try {
+      const saved = await persistWorkspace(next, false);
+      if (!saved) {
+        notify('本章尚未归档；请恢复保存连接后重试', 'error');
+        return;
+      }
+      const persisted = { ...next, revision: serverRevisionRef.current };
+      workspaceRef.current = persisted;
+      setWorkspace(persisted);
+      setView('blueprint');
+      setInspectorOpen(false);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      notify(`第 ${next.chapterHistory.at(-1)?.chapterNumber ?? ''} 章已归档到 Workspace；请确认第 ${next.currentChapter.number} 章契约`, 'success');
+    } finally {
+      chapterCycleBusyRef.current = false;
+    }
+  }, [notify, persistWorkspace]);
 
   const applyProjectChapterWorkspace = useCallback((nextChapterWorkspace) => {
     setProjectChapterWorkspace(nextChapterWorkspace);
@@ -1142,12 +1228,25 @@ export default function App() {
       return;
     }
     if (status === 'ready') {
+      if (activeStageId === 'blueprint' && isChapterCycleWorkspace(workspace) && !hasConfirmedCurrentChapterContract(workspace)) {
+        if (canConfirmCurrentChapterContract(workspace)) confirmCurrentChapterContract();
+        else notify('请先在蓝图页补齐当前章契约，再确认进入正文写作', 'warning');
+        return;
+      }
+      if (activeStageId === 'review' && canCompleteCurrentChapter(workspace)) {
+        completeCurrentChapter();
+        return;
+      }
       const next = getNextStage(activeStageId);
       navigate(next ? next.id : 'today');
       return;
     }
+    if (activeStageId === 'draft' && status === 'editing' && getDraftBody(workspace.stages.draft?.text).trim()) {
+      confirmSuggestion('draft');
+      return;
+    }
     generateStage(activeStageId);
-  }, [activeArtifact.status, activeStageId, confirmSuggestion, establishProject, generateStage, navigate, projectDashboard, saveProjectCandidate, updateWorkspace, view, workspace]);
+  }, [activeArtifact.status, activeStageId, completeCurrentChapter, confirmCurrentChapterContract, confirmSuggestion, establishProject, generateStage, navigate, notify, projectDashboard, saveProjectCandidate, view, workspace]);
 
   const primaryAction = projectDashboard && view === 'today'
     ? projectDashboard.chapter.contractReady
@@ -1342,6 +1441,8 @@ export default function App() {
               onIdeaRestore={restoreIdeaIteration}
               ideaConfigured={isConfiguredForStage('idea')}
               onIdeaSettings={() => setSettingsOpen(true)}
+              onCurrentChapterContractChange={changeCurrentChapterContract}
+              onConfirmCurrentChapterContract={confirmCurrentChapterContract}
             />
           )}
           {(!projectDashboard || view === 'today') && !ideaWorkshopActive && <PrimaryActionDock action={primaryAction} onAction={handlePrimaryAction} saveState={saveState} />}
@@ -1425,7 +1526,7 @@ function WorksHome({ workspaceLibrary, projects, busy, onNew, onOpenWorkspace, o
                   <span className="work-card-main">
                     <span className="work-card-flags">{item.active && <i>当前</i>}<b>{item.genre || '类型待定'}</b></span>
                     <strong>{item.title || '未命名作品'}</strong>
-                    <small>{stage.label} · {Number(item.readyStages ?? 0)}/5 阶段已确认</small>
+                    <small>{Number(item.currentChapterNumber ?? 1) > 1 ? `第 ${item.currentChapterNumber} 章 · ` : ''}{stage.label} · {Number(item.readyStages ?? 0)}/5 阶段已确认</small>
                   </span>
                   <span className="work-card-side">
                     <small>{formatDateTime(item.updatedAt)}</small>
@@ -1559,7 +1660,7 @@ function TopBar({ workspace, view, activeStage, riskCount, saveState, projectOpe
               <span className="popover-label">创作模式</span>
               <button type="button" className={`project-option origin-option ${!projectDashboard ? 'active' : ''}`} onClick={onOriginSelect}>
                 <Lightbulb size={16} />
-                <span><strong>{workspace.project.title || '当前创作作品'}</strong><small>Idea → 故事引擎 → 蓝图 → 第一章</small></span>
+                <span><strong>{workspace.project.title || '当前创作作品'}</strong><small>Idea → 故事引擎 → 蓝图 → 连续章节</small></span>
                 {!projectDashboard ? <Check size={15} /> : <ArrowRight size={14} />}
               </button>
               <span className="popover-label project-group-label">续写已有正文</span>
@@ -1697,12 +1798,15 @@ function TodayWorkspace({ workspace, settings, onProjectChange, onIdeaChange }) 
   const target = firstActionableStage(workspace);
   const targetArtifact = workspace.stages[target.id];
   const readyCount = STAGES.filter((stage) => workspace.stages[stage.id]?.status === 'ready').length;
+  const chapterNumber = workspace.currentChapter?.number ?? 1;
+  const completedChapterCount = Array.isArray(workspace.chapterHistory) ? workspace.chapterHistory.length : 0;
+  const continuing = isChapterCycleWorkspace(workspace) && completedChapterCount > 0;
   return (
     <div className="content-column today-content">
       <ContentHeader
         eyebrow="今日工作台"
-        title={hasProject ? `从 Idea 重新打磨「${projectTitle}」` : '从一个清晰的作品承诺开始'}
-        description={hasProject ? '先把这本书当作新书重新推演：不跳到第 4 章，只确认当前最重要的 Idea 产物。' : '可以先手写最小上下文，也可以直接进入 Idea 页让 AI 抽一张。'}
+        title={hasProject ? continuing ? `继续打磨「${projectTitle}」的第 ${chapterNumber} 章` : `从 Idea 打磨「${projectTitle}」的第一章` : '从一个清晰的作品承诺开始'}
+        description={hasProject ? continuing ? `前 ${completedChapterCount} 章已保留在创作 Workspace 历史中；当前只推进第 ${chapterNumber} 章，不会写入正式正文项目。` : '先把第一章的 Idea、逻辑、蓝图与章节契约逐项确认，再开始正文。' : '可以先手写最小上下文，也可以直接进入 Idea 页让 AI 抽一张。'}
       />
       {!hasProject ? (
         <section className="paper-card start-card">
@@ -1750,6 +1854,7 @@ function StageWorkspace({
   stageId, workspace, onProjectChange, onArtifactChange, onSuggestionChange,
   onIdeaDrawChange, onIdeaDraw, onIdeaFeedbackChange, onIdeaRefine,
   onIdeaConfirm, onIdeaRestore, ideaConfigured, onIdeaSettings,
+  onCurrentChapterContractChange, onConfirmCurrentChapterContract,
 }) {
   const artifact = workspace.stages[stageId];
   const copy = STAGE_COPY[stageId];
@@ -1789,9 +1894,19 @@ function StageWorkspace({
         <>
           <ArtifactStatusStrip artifact={artifact} />
           {stageId === 'logic' && <StoryEngineWorkshop artifact={readerArtifact} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
-          {stageId === 'blueprint' && <BlueprintWorkshop artifact={readerArtifact} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
+          {stageId === 'blueprint' && <BlueprintWorkshop
+            artifact={readerArtifact}
+            onSuggestionChange={onSuggestionChange}
+            readOnly={readerReadOnly}
+            currentChapter={workspace.currentChapter}
+            chapterHistory={workspace.chapterHistory}
+            chapterCycleEnabled={isChapterCycleWorkspace(workspace)}
+            onCurrentChapterContractChange={onCurrentChapterContractChange}
+            onConfirmCurrentChapterContract={onConfirmCurrentChapterContract}
+          />}
           {stageId === 'draft' && <DraftWorkshop artifact={readerArtifact} workspace={workspace} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
           {stageId === 'review' && <ReviewWorkshop artifact={readerArtifact} workspace={workspace} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
+          {stageId === 'review' && canCompleteCurrentChapter(workspace) && <ChapterCompletionPanel currentChapter={workspace.currentChapter} />}
         </>
       )}
       {hasDedicatedReader && (
@@ -1810,6 +1925,23 @@ function StageWorkspace({
       )}
       {stageId === 'idea' && artifact.confirmed != null && <ConfirmedPanel value={artifact.confirmed} status={artifact.status} confirmedAt={artifact.confirmedAt} />}
     </div>
+  );
+}
+
+function ChapterCompletionPanel({ currentChapter }) {
+  const nextNumber = Number(currentChapter?.number ?? 1) + 1;
+  return (
+    <section className="paper-card chapter-completion-panel">
+      <div className="card-heading-row compact">
+        <div className="section-icon green"><CheckCircle2 size={19} /></div>
+        <div>
+          <span className="section-kicker">本章连续写作检查点</span>
+          <h2>第 {currentChapter?.number ?? 1} 章已可归档</h2>
+          <p>当前章的契约、作者确认正文与审查结论会冻结为 Workspace 历史；下一步只准备第 {nextNumber} 章的待确认契约。</p>
+        </div>
+      </div>
+      <div className="quiet-note"><ShieldAlert size={15} /><span>不会创建正式正文项目，也不会向磁盘中的作者正文写入任何文件。</span></div>
+    </section>
   );
 }
 
@@ -1919,7 +2051,7 @@ function BlueprintEditor({ workspace, fields, value = {}, onChange, embedded = f
 
 function DraftEditor({ workspace, onChange, embedded = false }) {
   const artifact = workspace.stages.draft;
-  const contract = getChapterContract(workspace.stages.blueprint);
+  const contract = getConfirmedCurrentChapterContract(workspace);
   return (
     <>
       <section className="contract-card"><div className="contract-label"><ListChecks size={17} /><span>已确认章节契约</span></div><p>{summarizeChapterContract(contract) || '蓝图中尚未提取到章节契约。请先确认小说蓝图。'}</p></section>
@@ -2321,8 +2453,22 @@ function getPrimaryAction({ view, workspace, stageId, configured }) {
     ? { kicker: 'Idea 仍在打磨', label: '继续打磨 Idea', hint: '填写本轮反馈，反复迭代到你愿意定稿；不会默认确认。', icon: 'refresh' }
     : { kicker: '需要你的裁决', label: stageId === 'review' ? '采纳审查结论' : '确认采用建议稿', hint: '确认后写入作者账本并解锁下一阶段。', icon: 'check', tone: 'confirm' };
   if (status === 'ready') {
+    if (stageId === 'blueprint' && isChapterCycleWorkspace(workspace) && !hasConfirmedCurrentChapterContract(workspace)) {
+      const candidate = getCurrentChapterContractCandidate(workspace);
+      const chapterNumber = workspace.currentChapter?.number ?? 1;
+      return candidate
+        ? { kicker: '章节写作前置', label: `确认第 ${chapterNumber} 章契约`, hint: '蓝图候选仍是建议稿；请核对、编辑后再明确确认。', icon: 'check', tone: 'confirm' }
+        : { kicker: '章节写作前置', label: `补全第 ${chapterNumber} 章契约`, hint: '当前章还没有待确认契约，补齐后才能进入正文写作。', icon: 'check', tone: 'blocked' };
+    }
+    if (stageId === 'review' && canCompleteCurrentChapter(workspace)) {
+      const nextNumber = Number(workspace.currentChapter?.number ?? 1) + 1;
+      return { kicker: '本章已完成', label: `归档本章并准备第 ${nextNumber} 章`, hint: '只写入当前创作 Workspace；不会创建或覆盖正式正文项目。', icon: 'check', tone: 'complete' };
+    }
     const next = getNextStage(stageId);
     return { kicker: '本阶段已确认', label: next ? `进入${next.label}` : '返回今日工作台', hint: next ? '下一阶段将只读取已经确认的内容。' : '本轮从 Idea 到审查已形成完整账本。', icon: 'check', tone: 'complete' };
+  }
+  if (stageId === 'draft' && status === 'editing' && getDraftBody(workspace.stages.draft?.text).trim()) {
+    return { kicker: '作者正文待确认', label: '确认作者正文', hint: '确认后才能进入只读审查；不会写入正式正文项目。', icon: 'check', tone: 'confirm' };
   }
   if (!configured) return { kicker: 'AI 动作已阻塞', label: '配置模型后继续', hint: '仍可编辑并自动保存；密钥只由服务端保管。', icon: 'settings', tone: 'blocked' };
   if (status === 'stale') return { kicker: '上游已变化', label: '基于最新上游重新生成', hint: '旧产物会保留到新建议确认之后。', icon: 'refresh', tone: 'stale' };
@@ -2399,7 +2545,7 @@ function buildEntryConditions(workspace, settings, stageId) {
     const previous = STAGES[index - 1];
     conditions.push({ label: `${previous.label}已确认`, ok: workspace.stages[previous.id].status === 'ready' });
   } else conditions.push({ label: '可手写原始灵感或使用抽卡', ok: true });
-  if (stageId === 'draft') conditions.push({ label: '章节契约可读取', ok: Boolean(getChapterContract(workspace.stages.blueprint)) });
+  if (stageId === 'draft') conditions.push({ label: '当前章契约已确认', ok: hasConfirmedCurrentChapterContract(workspace) });
   if (stageId === 'review') conditions.push({ label: '章节正文可读取', ok: Boolean(getDraftBody(workspace.stages.draft.confirmed ?? workspace.stages.draft.text).trim()) });
   conditions.push({ label: `${getStage(stageId).label}模型已配置`, ok: route.configured });
   return conditions;
@@ -2416,18 +2562,16 @@ function buildRisks(workspace, settings, stageId) {
   if (artifact.status === 'stale') risks.push({ label: `当前产物因${getStage(artifact.staleFrom)?.label ?? '上游'}变化而过期`, tone: 'stale' });
   if (artifact.status === 'error') risks.push({ label: artifact.error?.message || '最近一次模型调用失败', tone: 'error' });
   if (stageId === 'idea' && !workspace.project.audience) risks.push({ label: '目标读者仍是一个待验证缺口', tone: 'neutral' });
-  if (stageId === 'blueprint' && !workspace.stages.blueprint.input?.chapterContract) risks.push({ label: '下一章契约尚未填写', tone: 'neutral' });
+  if (stageId === 'blueprint' && isChapterCycleWorkspace(workspace) && !hasConfirmedCurrentChapterContract(workspace)) {
+    risks.push({ label: `第 ${workspace.currentChapter?.number ?? 1} 章契约仍待作者确认`, tone: 'neutral' });
+  } else if (stageId === 'blueprint' && !workspace.stages.blueprint.input?.chapterContract) {
+    risks.push({ label: '下一章契约尚未填写', tone: 'neutral' });
+  }
   if (stageId === 'review') {
     const blockers = (workspace.stages.review.findings ?? []).filter((finding) => ['P0', 'P1'].includes(String(finding?.severity ?? finding?.priority ?? '').toUpperCase()));
     if (blockers.length) risks.push({ label: `${blockers.length} 个 P0/P1 审查问题待处理`, tone: 'error' });
   }
   return risks;
-}
-
-function getChapterContract(blueprintArtifact) {
-  const confirmed = tryParseJson(blueprintArtifact?.confirmed);
-  if (confirmed && typeof confirmed === 'object' && !Array.isArray(confirmed)) return confirmed.chapterContract ?? confirmed.nextChapterContract ?? confirmed.nextChapterContractCandidate ?? confirmed.selectedChapterContract ?? confirmed.selectedChapterContractCandidate ?? confirmed.contract ?? '';
-  return blueprintArtifact?.input?.chapterContract ?? '';
 }
 
 function summarizeChapterContract(contract) {

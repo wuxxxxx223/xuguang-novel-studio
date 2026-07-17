@@ -2197,6 +2197,108 @@ button:disabled { cursor: not-allowed; }
   border-top: 1px solid #e4ded5;
   background: #f8f6f1;
 }
+.workspace-chapter-contract-card,
+.workspace-chapter-history-card,
+.chapter-completion-panel { margin-top: 18px; }
+.workspace-chapter-contract-card { border-color: #cbd9d2; background: #fffefa; }
+.workspace-chapter-contract-body { margin-top: 18px; }
+.workspace-chapter-contract-editor {
+  margin-top: 14px;
+  border: 1px solid #dfd8ce;
+  border-radius: 8px;
+  background: #fbf9f5;
+}
+.workspace-chapter-contract-editor > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 13px 15px;
+  cursor: pointer;
+  color: #4a4b46;
+  font-size: 11px;
+  font-weight: 750;
+  list-style: none;
+}
+.workspace-chapter-contract-editor > summary::-webkit-details-marker { display: none; }
+.workspace-chapter-contract-editor > summary svg { transition: transform .2s ease; }
+.workspace-chapter-contract-editor[open] > summary svg { transform: rotate(180deg); }
+.workspace-chapter-contract-editor > p {
+  margin: 0;
+  padding: 0 15px 13px;
+  color: #77746d;
+  font-size: 10px;
+  line-height: 1.65;
+}
+.workspace-chapter-contract-editor .artifact-structure-fields { padding: 0 15px 15px; }
+.workspace-chapter-contract-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  margin-top: 16px;
+  padding-top: 15px;
+  border-top: 1px solid #e4ded5;
+}
+.workspace-chapter-contract-actions > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #68736c;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.workspace-chapter-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+}
+.workspace-chapter-history-list > details {
+  overflow: hidden;
+  border: 1px solid #ded8cf;
+  border-radius: 8px;
+  background: #fffdfa;
+}
+.workspace-chapter-history-list > details > summary {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 13px 15px;
+  cursor: pointer;
+  list-style: none;
+}
+.workspace-chapter-history-list > details > summary::-webkit-details-marker { display: none; }
+.workspace-chapter-history-list > details > summary > span {
+  color: #a26756;
+  font-family: Georgia, serif;
+  font-size: 9px;
+}
+.workspace-chapter-history-list > details > summary > strong {
+  overflow: hidden;
+  color: #41433f;
+  font-family: "Songti SC", "STSong", Georgia, serif;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-chapter-history-list > details > summary > small { color: #808078; font-size: 9px; }
+.workspace-chapter-history-detail {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 15px;
+  border-top: 1px solid #e8e1d7;
+  background: #faf8f4;
+}
+.workspace-chapter-history-detail > section { min-width: 0; }
+.workspace-chapter-history-detail h3 {
+  margin: 0 0 8px;
+  color: #64796d;
+  font-size: 10px;
+}
+.chapter-completion-panel { border-color: #c9d8d1; background: #f5faf6; }
 .blueprint-gap {
   min-width: 0;
   padding: 15px;
@@ -3243,4 +3345,12 @@ summary:focus-visible {
   .draw-mode-grid { grid-template-columns: 1fr; }
   .new-workspace-actions { align-items: stretch; flex-direction: column; }
   .new-workspace-actions .primary-button { width: 100%; justify-content: center; }
+}
+
+@media (max-width: 700px) {
+  .workspace-chapter-contract-actions { align-items: stretch; flex-direction: column; }
+  .workspace-chapter-contract-actions .primary-button { width: 100%; justify-content: center; }
+  .workspace-chapter-history-detail { grid-template-columns: 1fr; }
+  .workspace-chapter-history-list > details > summary { grid-template-columns: 40px minmax(0, 1fr) auto; }
+  .workspace-chapter-history-list > details > summary > small { display: none; }
 }
