@@ -8,8 +8,9 @@ import {
   Server, Settings2, ShieldAlert, Sparkles, Trash2, X,
 } from 'lucide-react';
 import {
-  ApiError, commitProjectChapterWriteBack, commitProjectContractDraft, confirmProjectChapterDraft, generateProjectChapterDraft, generateProjectContractDraft, generateWithAI,
-  getProjectChapterWorkspace, getProjectDashboard, getProjects, getSettings, getWorkspace,
+  ApiError, activateWorkspace, commitProjectChapterWriteBack, commitProjectContractDraft, confirmProjectChapterDraft, createWorkspaceRecord,
+  generateProjectChapterDraft, generateProjectContractDraft, generateWithAI,
+  getProjectChapterWorkspace, getProjectDashboard, getProjects, getSettings, getWorkspace, getWorkspaces,
   prepareProjectChapterWriteBack, prepareProjectContractDraft, reviewProjectChapterDraft, saveProjectChapterWorkspace, saveProjectContractDraft,
   saveSettings, saveWorkspace, testModelConnection,
 } from './api.js';
@@ -101,8 +102,16 @@ const PROVIDER_TYPE_LABELS = {
   'gemini-generate-content': 'Gemini Generate Content',
 };
 
+const EMPTY_NEW_WORKSPACE = Object.freeze({
+  title: '',
+  genre: '',
+  drawMode: 'random',
+  constraints: '',
+});
+
 export default function App() {
   const [workspace, setWorkspace] = useState(createWorkspace);
+  const [workspaceLibrary, setWorkspaceLibrary] = useState({ activeWorkspaceId: '', workspaces: [] });
   const [settings, setSettings] = useState(createSettings);
   const [projects, setProjects] = useState([]);
   const [activeProjectId, setActiveProjectId] = useState('');
@@ -115,7 +124,9 @@ export default function App() {
   const [projectDraftText, setProjectDraftText] = useState('');
   const [projectDraftDirty, setProjectDraftDirty] = useState(false);
   const [projectChapterBusy, setProjectChapterBusy] = useState('');
-  const [view, setView] = useState('today');
+  const [view, setView] = useState('library');
+  const [newWorkspaceDraft, setNewWorkspaceDraft] = useState(() => ({ ...EMPTY_NEW_WORKSPACE }));
+  const [workspaceLibraryBusy, setWorkspaceLibraryBusy] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadWarning, setLoadWarning] = useState('');
   const [saveState, setSaveState] = useState({ status: 'idle', message: '尚未保存' });
@@ -144,7 +155,9 @@ export default function App() {
   useEffect(() => {
     let active = true;
     async function hydrate() {
-      const [workspaceResult, settingsResult, projectsResult] = await Promise.allSettled([getWorkspace(), getSettings(), getProjects()]);
+      const [workspaceResult, workspaceLibraryResult, settingsResult, projectsResult] = await Promise.allSettled([
+        getWorkspace(), getWorkspaces(), getSettings(), getProjects(),
+      ]);
       if (!active) return;
       if (workspaceResult.status === 'fulfilled') {
         const normalizedWorkspace = normalizeWorkspace(workspaceResult.value);
@@ -152,6 +165,14 @@ export default function App() {
         setWorkspace(normalizedWorkspace);
       }
       else setLoadWarning('服务端 Workspace 暂时不可用；你仍可编辑，恢复连接后请手动保存。');
+      if (workspaceLibraryResult.status === 'fulfilled') {
+        setWorkspaceLibrary({
+          activeWorkspaceId: String(workspaceLibraryResult.value?.activeWorkspaceId ?? ''),
+          workspaces: Array.isArray(workspaceLibraryResult.value?.workspaces) ? workspaceLibraryResult.value.workspaces : [],
+        });
+      } else {
+        setLoadWarning('作品主界面暂时不可用；请恢复服务连接后重试。');
+      }
       if (settingsResult.status === 'fulfilled') setSettings(normalizeSettings(settingsResult.value));
       else if (workspaceResult.status === 'fulfilled') setLoadWarning('模型配置尚未读取；需要 AI 时可在应用内重新配置。');
       if (projectsResult.status === 'fulfilled') {
@@ -212,6 +233,16 @@ export default function App() {
     }
   }, [notify, saveWorkspaceQueued]);
 
+  const refreshWorkspaceLibrary = useCallback(async () => {
+    const response = await getWorkspaces();
+    const next = {
+      activeWorkspaceId: String(response?.activeWorkspaceId ?? ''),
+      workspaces: Array.isArray(response?.workspaces) ? response.workspaces : [],
+    };
+    setWorkspaceLibrary(next);
+    return next;
+  }, []);
+
   useEffect(() => {
     if (!hydratedRef.current || localVersionRef.current <= savedVersionRef.current) return undefined;
     const versionAtSchedule = localVersionRef.current;
@@ -260,7 +291,12 @@ export default function App() {
   }, [projectContractDirty, projectDraftDirty]);
 
   const projectViews = ['today', 'project-contract', 'project-chapter', 'model-lab', 'project-review', 'project-writeback'];
-  const activeStageId = projectViews.includes(view) ? (view === 'today' ? firstActionableStage(workspace).id : ['project-review', 'project-writeback'].includes(view) ? 'review' : view === 'project-contract' ? 'blueprint' : 'draft') : view;
+  const libraryViews = ['library', 'new-workspace'];
+  const activeStageId = libraryViews.includes(view)
+    ? (workspace.currentStage || 'idea')
+    : projectViews.includes(view)
+      ? (view === 'today' ? firstActionableStage(workspace).id : ['project-review', 'project-writeback'].includes(view) ? 'review' : view === 'project-contract' ? 'blueprint' : 'draft')
+      : view;
   const activeStage = getStage(activeStageId);
   const activeArtifact = workspace.stages[activeStageId];
   const projectFindings = Array.isArray(projectChapterWorkspace?.review?.result?.findings) ? projectChapterWorkspace.review.result.findings : [];
@@ -291,14 +327,16 @@ export default function App() {
 
   useEffect(() => {
     const project = projectDashboard?.project?.title || workspace.project.title || '未命名作品';
-    const page = view === 'today' ? '今日工作台'
+    const page = view === 'library' ? '作品主界面'
+      : view === 'new-workspace' ? '新建作品'
+        : view === 'today' ? '今日工作台'
       : view === 'project-contract' ? `第 ${projectDashboard?.chapter?.number ?? ''} 章章节契约`
         : view === 'project-chapter' ? `第 ${projectDashboard?.chapter?.number ?? ''} 章候选稿`
         : view === 'model-lab' ? '模型校准'
           : view === 'project-review' ? '审查定稿'
             : view === 'project-writeback' ? '正式写回预览'
               : activeStage.label;
-    document.title = `${project} · ${page} — 叙光`;
+    document.title = libraryViews.includes(view) ? `${page} — 叙光` : `${project} · ${page} — 叙光`;
   }, [workspace.project.title, view, activeStage.label, projectDashboard]);
 
   const confirmProjectLeave = useCallback(() => {
@@ -309,16 +347,9 @@ export default function App() {
     return window.confirm(`${parts.join('和')}还有未保存修改。离开会放弃这些修改，确定继续吗？`);
   }, [projectContractDirty, projectDraftDirty]);
 
-  const enterOriginWorkspace = useCallback(() => {
-    if (projectChapterBusy) {
-      notify('当前章节操作仍在执行，请完成后再切换创作模式', 'warning');
-      return;
-    }
-    if (!confirmProjectLeave()) return;
+  const clearFormalProjectState = useCallback(() => {
     projectRequestEpochRef.current += 1;
     activeProjectIdRef.current = '';
-    setProjectOpen(false);
-    setCommandOpen(false);
     setActiveProjectId('');
     setProjectDashboard(null);
     setProjectChapterWorkspace(null);
@@ -329,14 +360,137 @@ export default function App() {
     setProjectDraftText('');
     setProjectDraftDirty(false);
     setProjectChapterBusy('');
+  }, []);
+
+  const goToLibrary = useCallback(async () => {
+    if (projectChapterBusy) {
+      notify('当前章节操作仍在执行，请完成后再返回主界面', 'warning');
+      return;
+    }
+    if (!confirmProjectLeave()) return;
+    if (!projectDashboard && localVersionRef.current > savedVersionRef.current) {
+      const saved = await persistWorkspace(workspaceRef.current);
+      if (!saved) {
+        notify('当前作品保存失败，已留在工作台；请恢复连接后重试', 'error');
+        return;
+      }
+    }
+    setProjectOpen(false);
+    setCommandOpen(false);
+    setInspectorOpen(false);
+    setView('library');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    try {
+      await refreshWorkspaceLibrary();
+      setLoadWarning('');
+    } catch {
+      setLoadWarning('作品主界面暂时不可用；请恢复服务连接后重试。');
+    }
+  }, [confirmProjectLeave, notify, persistWorkspace, projectChapterBusy, projectDashboard, refreshWorkspaceLibrary]);
+
+  const openWorkspaceRecord = useCallback(async (workspaceId) => {
+    if (!workspaceId || workspaceLibraryBusy) return;
+    if (projectChapterBusy) {
+      notify('当前章节操作仍在执行，请完成后再切换作品', 'warning');
+      return;
+    }
+    if (!confirmProjectLeave()) return;
+    setWorkspaceLibraryBusy(workspaceId);
+    try {
+      if (!projectDashboard && localVersionRef.current > savedVersionRef.current) {
+        const saved = await persistWorkspace(workspaceRef.current);
+        if (!saved) throw new Error('当前作品尚未保存，已停止切换。');
+      }
+      await workspaceSaveQueueRef.current.catch(() => undefined);
+      const response = await activateWorkspace(workspaceId);
+      const nextWorkspace = normalizeWorkspace(response);
+      serverRevisionRef.current = nextWorkspace.revision;
+      localVersionRef.current = 0;
+      savedVersionRef.current = 0;
+      workspaceSaveQueueRef.current = Promise.resolve();
+      generationEpochRef.current += 1;
+      setWorkspace(nextWorkspace);
+      clearFormalProjectState();
+      setWorkspaceLibrary((current) => ({
+        activeWorkspaceId: String(response?.workspaceId ?? workspaceId),
+        workspaces: current.workspaces.map((item) => ({ ...item, active: item.id === workspaceId })),
+      }));
+      setSaveState({ status: 'saved', message: `已打开 · r${nextWorkspace.revision}` });
+      setView('today');
+      setLoadWarning('');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (error) {
+      notify(toErrorMessage(error), 'error');
+    } finally {
+      setWorkspaceLibraryBusy('');
+    }
+  }, [clearFormalProjectState, confirmProjectLeave, notify, persistWorkspace, projectChapterBusy, projectDashboard, workspaceLibraryBusy]);
+
+  const createNewWorkspace = useCallback(async () => {
+    if (workspaceLibraryBusy) return;
+    const drawMode = newWorkspaceDraft.drawMode === 'guided' ? 'guided' : 'random';
+    const constraints = String(newWorkspaceDraft.constraints ?? '').trim();
+    if (drawMode === 'guided' && !constraints) {
+      notify('给定方向模式下，请先写一句大概方向或限制', 'warning');
+      return;
+    }
+    setWorkspaceLibraryBusy('creating');
+    try {
+      if (!projectDashboard && localVersionRef.current > savedVersionRef.current) {
+        const saved = await persistWorkspace(workspaceRef.current);
+        if (!saved) throw new Error('当前作品尚未保存，已停止新建。');
+      }
+      await workspaceSaveQueueRef.current.catch(() => undefined);
+      const response = await createWorkspaceRecord({
+        title: String(newWorkspaceDraft.title ?? '').trim(),
+        genre: String(newWorkspaceDraft.genre ?? '').trim(),
+        drawMode,
+        constraints,
+      });
+      const nextWorkspace = normalizeWorkspace(response);
+      serverRevisionRef.current = nextWorkspace.revision;
+      localVersionRef.current = 0;
+      savedVersionRef.current = 0;
+      workspaceSaveQueueRef.current = Promise.resolve();
+      generationEpochRef.current += 1;
+      setWorkspace(nextWorkspace);
+      clearFormalProjectState();
+      setNewWorkspaceDraft({ ...EMPTY_NEW_WORKSPACE });
+      await refreshWorkspaceLibrary();
+      setSaveState({ status: 'saved', message: '新作品已创建' });
+      setLoadWarning('');
+      setView('idea');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      notify('新作品已建立；现在可以抽一组 Idea', 'success');
+    } catch (error) {
+      notify(toErrorMessage(error), 'error');
+    } finally {
+      setWorkspaceLibraryBusy('');
+    }
+  }, [clearFormalProjectState, newWorkspaceDraft, notify, persistWorkspace, projectDashboard, refreshWorkspaceLibrary, workspaceLibraryBusy]);
+
+  const enterOriginWorkspace = useCallback(() => {
+    if (projectChapterBusy) {
+      notify('当前章节操作仍在执行，请完成后再切换创作模式', 'warning');
+      return;
+    }
+    if (!confirmProjectLeave()) return;
+    setProjectOpen(false);
+    setCommandOpen(false);
+    clearFormalProjectState();
     setView('today');
     window.scrollTo({ top: 0, behavior: 'smooth' });
-    notify('已返回开书重建，从 Idea 开始打磨', 'success');
-  }, [confirmProjectLeave, notify, projectChapterBusy]);
+    notify('已返回当前创作作品', 'success');
+  }, [clearFormalProjectState, confirmProjectLeave, notify, projectChapterBusy]);
 
   const selectProject = useCallback(async (projectId) => {
     setProjectOpen(false);
-    if (!projectId || (projectId === activeProjectId && projectDashboard)) return;
+    if (!projectId) return;
+    if (projectId === activeProjectId && projectDashboard) {
+      setView('today');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
     if (projectChapterBusy) {
       notify('当前章节操作仍在执行，请完成后再切换作品', 'warning');
       return;
@@ -1023,6 +1177,58 @@ export default function App() {
 
   if (loading) return <LoadingScreen />;
 
+  if (libraryViews.includes(view)) {
+    return (
+      <div className="app-frame library-frame">
+        <LibraryTopBar
+          workspaceCount={workspaceLibrary.workspaces.length}
+          projectCount={projects.length}
+          onSettings={() => setSettingsOpen(true)}
+          onHome={() => setView('library')}
+        />
+        {loadWarning && (
+          <div className="connection-banner" role="status">
+            <AlertTriangle size={16} /><span>{loadWarning}</span>
+            <button type="button" onClick={() => refreshWorkspaceLibrary().then(() => setLoadWarning('')).catch(() => undefined)}>重试读取</button>
+          </div>
+        )}
+        <main className="library-main">
+          {view === 'library' ? (
+            <WorksHome
+              workspaceLibrary={workspaceLibrary}
+              projects={projects}
+              busy={workspaceLibraryBusy}
+              onNew={() => {
+                setNewWorkspaceDraft({ ...EMPTY_NEW_WORKSPACE });
+                setView('new-workspace');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              onOpenWorkspace={openWorkspaceRecord}
+              onOpenProject={selectProject}
+            />
+          ) : (
+            <NewWorkspaceScreen
+              draft={newWorkspaceDraft}
+              busy={workspaceLibraryBusy === 'creating'}
+              onChange={(patch) => setNewWorkspaceDraft((current) => ({ ...current, ...patch }))}
+              onCancel={() => setView('library')}
+              onCreate={createNewWorkspace}
+            />
+          )}
+        </main>
+        {settingsOpen && (
+          <SettingsDrawer initialSettings={settings} onClose={() => setSettingsOpen(false)} onSaved={onSettingsSaved} notify={notify} />
+        )}
+        {toast && (
+          <div className={`toast toast-${toast.tone}`} role="status">
+            {toast.tone === 'success' ? <CheckCircle2 size={17} /> : toast.tone === 'error' ? <AlertCircle size={17} /> : <Circle size={12} />}
+            <span>{toast.message}</span>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="app-frame">
       <TopBar
@@ -1043,7 +1249,7 @@ export default function App() {
           setCommandOpen(false); setInspectorOpen(true);
           setTimeout(() => document.getElementById('run-history')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100);
         }}
-        onSettings={() => setSettingsOpen(true)} onInspector={() => setInspectorOpen(true)}
+        onSettings={() => setSettingsOpen(true)} onInspector={() => setInspectorOpen(true)} onHome={goToLibrary}
       />
 
       {loadWarning && (
@@ -1163,7 +1369,174 @@ export default function App() {
   );
 }
 
-function TopBar({ workspace, view, activeStage, riskCount, saveState, projectOpen, commandOpen, projects, activeProjectId, projectDashboard, onProjectToggle, onProjectSelect, onOriginSelect, onCommandToggle, onSave, onExport, onHistory, onSettings, onInspector }) {
+function LibraryTopBar({ workspaceCount, projectCount, onSettings, onHome }) {
+  return (
+    <header className="topbar library-topbar">
+      <button type="button" className="brand-block brand-button" onClick={onHome} aria-label="返回作品主界面">
+        <span className="brand-mark"><BookOpenText size={20} strokeWidth={1.8} /></span>
+        <div><strong>叙光</strong><span>Novel Studio</span></div>
+      </button>
+      <div className="location-bar" aria-label="当前位置">
+        <div className="location-segment">
+          <span className="location-kicker">当前位置</span>
+          <span className="location-value">作品主界面</span>
+        </div>
+        <span className="location-divider" />
+        <div className="location-segment hide-compact">
+          <span className="location-kicker">作品库</span>
+          <span className="location-value">{workspaceCount} 个创作作品 · {projectCount} 个正文项目</span>
+        </div>
+      </div>
+      <div className="top-actions">
+        <button type="button" className="icon-button" onClick={onSettings} aria-label="模型配置"><Settings2 size={18} /></button>
+      </div>
+    </header>
+  );
+}
+
+function WorksHome({ workspaceLibrary, projects, busy, onNew, onOpenWorkspace, onOpenProject }) {
+  const workspaces = Array.isArray(workspaceLibrary.workspaces) ? workspaceLibrary.workspaces : [];
+  return (
+    <div className="library-content">
+      <header className="library-heading">
+        <div>
+          <span className="content-eyebrow">作品主界面</span>
+          <h1>先选一本书，再进入它的工作台</h1>
+          <p>创作中的新书与已有正文项目分开保存。新建作品不会覆盖你正在打磨的章节。</p>
+        </div>
+        <button type="button" className="primary-button library-new-button" onClick={onNew} disabled={Boolean(busy)}>
+          <Plus size={18} /><span>新建作品</span><ArrowRight size={17} />
+        </button>
+      </header>
+
+      <section className="library-section">
+        <div className="library-section-heading">
+          <div><span className="section-kicker">创作中的作品</span><h2>从 Idea 开始的独立工作区</h2></div>
+          <span>{workspaces.length} 本</span>
+        </div>
+        {workspaces.length ? (
+          <div className="work-card-grid">
+            {workspaces.map((item) => {
+              const stage = getStage(item.currentStage);
+              const opening = busy === item.id;
+              return (
+                <button type="button" className={`work-card ${item.active ? 'active' : ''}`} key={item.id} onClick={() => onOpenWorkspace(item.id)} disabled={Boolean(busy)}>
+                  <span className="work-card-icon"><Lightbulb size={19} /></span>
+                  <span className="work-card-main">
+                    <span className="work-card-flags">{item.active && <i>当前</i>}<b>{item.genre || '类型待定'}</b></span>
+                    <strong>{item.title || '未命名作品'}</strong>
+                    <small>{stage.label} · {Number(item.readyStages ?? 0)}/5 阶段已确认</small>
+                  </span>
+                  <span className="work-card-side">
+                    <small>{formatDateTime(item.updatedAt)}</small>
+                    {opening ? <LoaderCircle size={17} className="spin" /> : <ArrowRight size={17} />}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="library-empty">
+            <Sparkles size={22} />
+            <div><strong>还没有创作中的作品</strong><p>可以完全随机抽卡，也可以先写一句方向限制。</p></div>
+          </div>
+        )}
+      </section>
+
+      <section className="library-section formal-library-section">
+        <div className="library-section-heading">
+          <div><span className="section-kicker">已有正文项目</span><h2>继续磁盘中的正式小说</h2></div>
+          <span>{projects.length} 本</span>
+        </div>
+        {projects.length ? (
+          <div className="work-card-grid">
+            {projects.map((project) => {
+              const opening = busy === `project:${project.id}`;
+              return (
+                <button type="button" className="work-card formal-work-card" key={project.id} onClick={() => onOpenProject(project.id)} disabled={Boolean(busy)}>
+                  <span className="work-card-icon"><BookMarked size={19} /></span>
+                  <span className="work-card-main">
+                    <span className="work-card-flags"><b>正式正文</b></span>
+                    <strong>{project.title}</strong>
+                    <small>{project.currentChapter ? `当前第 ${project.currentChapter} 章` : '等待恢复当前章'} · 进入日更工作台</small>
+                  </span>
+                  <span className="work-card-side">
+                    <small>{project.updatedAt ? formatDateTime(project.updatedAt) : '本地项目'}</small>
+                    {opening ? <LoaderCircle size={17} className="spin" /> : <ArrowRight size={17} />}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="library-empty compact">
+            <BookMarked size={20} />
+            <div><strong>没有发现正式正文项目</strong><p>只有同时包含正文、设定、大纲和追踪目录的项目才会出现在这里。</p></div>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function NewWorkspaceScreen({ draft, busy, onChange, onCancel, onCreate }) {
+  const guided = draft.drawMode === 'guided';
+  return (
+    <div className="library-content new-workspace-content">
+      <button type="button" className="library-back-button" onClick={onCancel} disabled={busy}>
+        <Home size={15} />返回作品主界面
+      </button>
+      <header className="library-heading new-workspace-heading">
+        <div>
+          <span className="content-eyebrow">新建作品</span>
+          <h1>先建立最小边界，再进入 Idea 抽卡</h1>
+          <p>作品名和类型都可以留空。创建只建立独立工作区，不会立即调用模型或消耗额度。</p>
+        </div>
+      </header>
+      <section className="paper-card new-workspace-card">
+        <div className="card-heading-row">
+          <div className="section-icon coral"><Sparkles size={19} /></div>
+          <div><span className="section-kicker">从零开始</span><h2>这次想怎么抽</h2></div>
+        </div>
+        <div className="form-grid two-col">
+          <Field label="作品名" hint="可留空，抽卡后再决定">
+            <input value={draft.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="未命名作品" autoFocus />
+          </Field>
+          <Field label="类型" hint="可留空，让模型参与组合">
+            <input value={draft.genre} onChange={(event) => onChange({ genre: event.target.value })} placeholder="仙侠 / 悬疑 / 言情 / 完全未知…" />
+          </Field>
+        </div>
+        <div className="draw-mode-grid" role="radiogroup" aria-label="抽卡方式">
+          <button type="button" className={guided ? '' : 'active'} onClick={() => onChange({ drawMode: 'random' })} aria-pressed={!guided}>
+            <span className="draw-mode-icon"><Sparkles size={18} /></span>
+            <span><strong>完全随机</strong><small>不设方向，随机组合题材、身份、矛盾和机制。</small></span>
+            {!guided && <Check size={16} />}
+          </button>
+          <button type="button" className={guided ? 'active' : ''} onClick={() => onChange({ drawMode: 'guided' })} aria-pressed={guided}>
+            <span className="draw-mode-icon"><Compass size={18} /></span>
+            <span><strong>给定方向</strong><small>只写大概方向、想保留的元素或明确禁区。</small></span>
+            {guided && <Check size={16} />}
+          </button>
+        </div>
+        {guided && (
+          <Field label="大概方向或限制" hint="它只是抽卡边界，不会自动成为已确认设定。">
+            <textarea rows={7} value={draft.constraints} onChange={(event) => onChange({ constraints: event.target.value })} placeholder="例如：东方仙侠；主角谨慎但不窝囊；不要系统面板；开局必须有明确生存危机。" />
+          </Field>
+        )}
+        <div className="new-workspace-actions">
+          <div><ShieldAlert size={16} /><span>每本作品独立保存；抽卡结果仍要由你确认后才成为事实。</span></div>
+          <button type="button" className="primary-button" onClick={onCreate} disabled={busy || (guided && !String(draft.constraints ?? '').trim())}>
+            {busy ? <LoaderCircle size={18} className="spin" /> : <Sparkles size={18} />}
+            <span>{busy ? '正在创建…' : '创建作品并进入抽卡'}</span>
+            {!busy && <ArrowRight size={17} />}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function TopBar({ workspace, view, activeStage, riskCount, saveState, projectOpen, commandOpen, projects, activeProjectId, projectDashboard, onProjectToggle, onProjectSelect, onOriginSelect, onCommandToggle, onSave, onExport, onHistory, onSettings, onInspector, onHome }) {
   const projectTitle = projectDashboard?.project?.title || workspace.project.title || '未命名作品';
   const objectLabel = projectDashboard && ['today', 'project-contract', 'project-chapter', 'model-lab', 'project-review', 'project-writeback'].includes(view)
     ? `第 ${projectDashboard.chapter.number} 章`
@@ -1171,10 +1544,10 @@ function TopBar({ workspace, view, activeStage, riskCount, saveState, projectOpe
   const stageLabel = projectDashboard && view === 'today' ? projectDashboard.today.stage : view === 'project-contract' ? '章节契约' : view === 'project-chapter' ? '候选正文' : view === 'model-lab' ? '模型校准' : view === 'project-review' ? '审查定稿' : view === 'project-writeback' ? '正式写回' : view === 'today' ? firstActionableStage(workspace).shortLabel : activeStage.shortLabel;
   return (
     <header className="topbar">
-      <div className="brand-block" aria-label="叙光 Novel Studio">
+      <button type="button" className="brand-block brand-button" onClick={onHome} aria-label="返回作品主界面">
         <span className="brand-mark"><BookOpenText size={20} strokeWidth={1.8} /></span>
         <div><strong>叙光</strong><span>Novel Studio</span></div>
-      </div>
+      </button>
       <div className="location-bar" aria-label="当前位置">
         <div className="location-segment project-switcher">
           <span className="location-kicker">作品</span>
@@ -1186,7 +1559,7 @@ function TopBar({ workspace, view, activeStage, riskCount, saveState, projectOpe
               <span className="popover-label">创作模式</span>
               <button type="button" className={`project-option origin-option ${!projectDashboard ? 'active' : ''}`} onClick={onOriginSelect}>
                 <Lightbulb size={16} />
-                <span><strong>开书重建 · 从 Idea 开始</strong><small>作品承诺 → 故事引擎 → 蓝图 → 第一章</small></span>
+                <span><strong>{workspace.project.title || '当前创作作品'}</strong><small>Idea → 故事引擎 → 蓝图 → 第一章</small></span>
                 {!projectDashboard ? <Check size={15} /> : <ArrowRight size={14} />}
               </button>
               <span className="popover-label project-group-label">续写已有正文</span>
@@ -2156,9 +2529,3 @@ function cloneValue(value) {
   if (typeof structuredClone === 'function') return structuredClone(value);
   return JSON.parse(JSON.stringify(value));
 }
-
-
-
-
-
-

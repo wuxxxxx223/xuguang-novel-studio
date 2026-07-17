@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { createProjectLibrary } from './project-library.mjs';
+import { createWorkspaceLibrary } from './workspace-library.mjs';
 import { createCanonRevisionStore } from './canon-revision.mjs';
 import { createRunLedger } from './run-ledger.mjs';
 import { createBenchmarkHarness } from './benchmark-harness.mjs';
@@ -630,13 +631,19 @@ function normalizeWorkspace(input, revisionOverride) {
   return workspace;
 }
 async function loadWorkspace() {
-  const raw = await readJsonFile(WORKSPACE_FILE, defaultWorkspace(), WORKSPACE_LIMIT);
-  try { return normalizeWorkspace(raw); }
+  try { return await workspaceLibrary.getActiveWorkspace(); }
   catch (error) {
-    if (error instanceof HttpError) throw new HttpError(500, 'WORKSPACE_FILE_INVALID', 'workspace.json 的结构无效。');
-    throw error;
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(500, 'WORKSPACE_LIBRARY_INVALID', 'Workspace 作品库结构无效。');
   }
 }
+const workspaceLibrary = createWorkspaceLibrary({
+  dataDir: DATA_DIR,
+  legacyWorkspaceFile: WORKSPACE_FILE,
+  defaultWorkspace,
+  normalizeWorkspace,
+  notFound: (message) => new HttpError(404, 'WORKSPACE_NOT_FOUND', message),
+});
 function parseWorkspacePut(body) {
   assertObject(body, '请求体');
   const wrapped = hasOwn(body, 'workspace');
@@ -2518,6 +2525,41 @@ async function handleSettingsTest(req, res) {
 app.post('/api/settings/test', handleSettingsTest);
 app.post('/api/models/test', handleSettingsTest);
 
+app.get('/api/workspaces', async (_req, res) => {
+  const library = await workspaceLibrary.listWorkspaces();
+  sendJson(res, 200, { ok: true, ...library });
+});
+app.post('/api/workspaces', async (req, res) => {
+  assertObject(req.body, '请求体');
+  const title = String(req.body.title ?? '').trim();
+  const genre = String(req.body.genre ?? '').trim();
+  const audience = String(req.body.audience ?? '').trim();
+  const tone = String(req.body.tone ?? '').trim();
+  const ideaInput = String(req.body.ideaInput ?? '').trim();
+  const drawMode = req.body.drawMode === 'guided' ? 'guided' : 'random';
+  const constraints = String(req.body.constraints ?? '').trim();
+  if (title.length > 200) throw new HttpError(400, 'WORKSPACE_TITLE_TOO_LONG', '作品名不能超过 200 字符。');
+  if (genre.length > 160 || audience.length > 200 || tone.length > 200) {
+    throw new HttpError(400, 'WORKSPACE_PROJECT_FIELD_TOO_LONG', '作品类型、目标读者或语气过长。');
+  }
+  if (ideaInput.length > 20_000) throw new HttpError(400, 'WORKSPACE_IDEA_TOO_LONG', '原始 Idea 不能超过 20000 字符。');
+  if (constraints.length > 4000) throw new HttpError(400, 'IDEA_DRAW_CONSTRAINTS_TOO_LONG', 'Idea 抽卡方向不能超过 4000 字符。');
+  const initial = defaultWorkspace();
+  initial.project = { title, genre, audience, tone };
+  initial.currentChapter = { number: 1, title: '第一章' };
+  initial.stages.idea = {
+    ...initial.stages.idea,
+    input: ideaInput,
+    draw: { mode: drawMode, constraints: drawMode === 'guided' ? constraints : '' },
+  };
+  const created = await queueWorkspaceWrite(() => workspaceLibrary.createWorkspace(initial));
+  sendJson(res, 201, { ok: true, ...created });
+});
+app.post('/api/workspaces/:workspaceId/activate', async (req, res) => {
+  const activated = await queueWorkspaceWrite(() => workspaceLibrary.activateWorkspace(req.params.workspaceId));
+  sendJson(res, 200, { ok: true, ...activated });
+});
+
 app.get('/api/workspace', async (_req, res) => {
   const workspace = await loadWorkspace();
   sendJson(res, 200, { ok: true, revision: workspace.revision, workspace });
@@ -2533,8 +2575,7 @@ app.put('/api/workspace', async (req, res) => {
       });
     }
     const next = normalizeWorkspace(candidate, current.revision + 1);
-    await writeJsonAtomic(WORKSPACE_FILE, next);
-    return next;
+    return workspaceLibrary.saveActiveWorkspace(next);
   });
   sendJson(res, 200, { ok: true, revision: workspace.revision, workspace });
 });

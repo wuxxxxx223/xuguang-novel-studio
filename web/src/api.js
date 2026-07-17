@@ -57,6 +57,24 @@ export function getProjects() {
   return request('/api/projects');
 }
 
+export function getWorkspaces() {
+  return request('/api/workspaces');
+}
+
+export function createWorkspaceRecord(input) {
+  return request('/api/workspaces', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function activateWorkspace(workspaceId) {
+  return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/activate`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
 export function getProjectDashboard(projectId) {
   return request(`/api/projects/${encodeURIComponent(projectId)}/dashboard`);
 }
@@ -174,5 +192,4 @@ export function generateWithAI({ stage, workspace, input, context, refinement = 
     }),
   });
 }
-
 
