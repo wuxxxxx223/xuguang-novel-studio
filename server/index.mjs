@@ -38,7 +38,7 @@ import {
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(SERVER_DIR, '..');
 const RUNTIME = loadRuntimeConfig({ projectDir: PROJECT_DIR });
-if (RUNTIME.production) process.umask(0o077);
+if (RUNTIME.production && process.platform !== 'win32') process.umask(0o077);
 await assertRuntimeFilesystem(RUNTIME);
 const INSTANCE_LOCK = await acquireInstanceLock(RUNTIME);
 const DATA_DIR = RUNTIME.dataDir;
@@ -1969,6 +1969,7 @@ app.use(express.json({ limit: BODY_LIMIT, strict: true, type: 'application/json'
 function baseHealth() {
   return {
     service: 'novel-studio-next',
+    platform: process.platform,
     version: APP_VERSION,
     time: new Date().toISOString(),
     startedAt: STARTED_AT,

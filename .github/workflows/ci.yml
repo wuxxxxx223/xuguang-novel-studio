@@ -14,8 +14,13 @@ concurrency:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Verify on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
 
     steps:
       - name: Checkout
@@ -35,3 +40,11 @@ jobs:
 
       - name: Smoke tests
         run: npm run test:all
+
+      - name: Deployment checks
+        run: npm run check:deployment
+
+      - name: Windows launcher and development smoke
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\windows\ci-smoke.ps1

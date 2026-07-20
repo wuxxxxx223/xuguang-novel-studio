@@ -2,11 +2,25 @@
 
 ## 环境要求
 
+- Windows 10/11（默认开发平台）或受支持的 Linux 环境
 - Node.js `22.12` 或更高版本，且低于 `25`
 - npm `10` 或更高版本
 - Git
 
 ## 本地启动
+
+Windows 推荐：
+
+```powershell
+git clone <repository-url>
+Set-Location xuguang-novel-studio
+.\setup-windows.cmd
+.\dev-xuguang.cmd
+```
+
+Windows 启动器使用 `%LOCALAPPDATA%\XuguangNovelStudio` 和用户文档目录，不与 WSL 共用运行数据。
+
+通用 npm 方式：
 
 ```bash
 git clone <repository-url>
@@ -62,6 +76,8 @@ npm run test:all
 ```bash
 npm run release:verify
 ```
+
+Windows 本地无法直接验证 Linux shell 语法时，`npm run check:deployment` 会完成 Node 部署脚本检查，并由 GitHub Actions 的 Ubuntu 任务验证 `deploy/*.sh`。
 
 通过 Pull Request 合并到 `main`。PR 需要说明：
 

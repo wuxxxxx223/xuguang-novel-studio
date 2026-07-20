@@ -1,8 +1,53 @@
 # 叙光 Novel Studio
 
-全新独立的 AI 小说创作工作台，不依赖旧 `workbench/` 或 `novel-compiler/studio` 前端。
+独立的 AI 小说创作工作台，默认面向 Windows 10/11 开发，不依赖旧 `workbench/` 或 `novel-compiler/studio` 前端。
 
 本仓库只同步产品代码。作者 Workspace、小说正文、模型密钥和运行数据均保留在本地或生产数据目录，不进入 Git。
+
+## Windows 三分钟启动
+
+准备 Git for Windows 后，在 PowerShell 中运行：
+
+```powershell
+git clone git@github.com:wuxxxxx223/xuguang-novel-studio.git
+Set-Location xuguang-novel-studio
+.\setup-windows.cmd
+```
+
+安装脚本会检查 Node.js `22.12-24.x`；缺失时优先通过 `winget` 安装当前 Node.js LTS，然后执行 `npm ci`、构建并打开应用。
+
+日常入口：
+
+- `dev-xuguang.cmd`：启动 Windows 原生热更新开发环境。
+- `launch-xuguang.cmd`：构建并在后台启动本地应用。
+- `stop-xuguang.cmd`：只停止由 Windows 启动器记录的后台实例。
+
+Windows 数据保存在 `%LOCALAPPDATA%\XuguangNovelStudio`，默认小说库保存在 `%USERPROFILE%\Documents\Xuguang Novel Library`。启动器只会复用 Windows 原生 `win32` 服务；即使 WSL 已占用默认端口，也会选择其他端口和独立数据目录。
+
+## 隔离体验模式
+
+这是给协作者、评审者和第一次试用者的最快路径：它会启动一套**隔离的临时数据目录**，不会读取或修改本机 `.data/`、作者正文或已有模型 Key。
+
+```bash
+npm ci
+npm run quickstart
+```
+
+然后打开 `http://127.0.0.1:5178/`。无需 Docker、生产环境、小说库或 API Key；没有配置模型时仍可浏览界面、手写内容和审查流程。按 `Ctrl+C` 停止后，本次临时体验数据会自动清理。
+
+启动前想检查 Node 版本、依赖和默认端口，可执行：
+
+```bash
+npm run doctor
+```
+
+若 `5178` / `8790` 被其他程序占用，先关闭已有本地服务，或使用一对空闲端口：
+
+```bash
+npm run quickstart -- --web-port 15178 --api-port 18790
+```
+
+需要打开或继续本机真实 Workspace 时，Windows 使用 `dev-xuguang.cmd`；其他平台可使用下方的 `npm run dev`。它们会读取持久化数据目录，和隔离体验模式不同。
 
 ## 开发运行
 
@@ -12,6 +57,8 @@ npm run dev
 ```
 
 访问 `http://127.0.0.1:5178/`，API 运行在 `http://127.0.0.1:8790/`。
+
+直接运行 npm 命令时，默认数据目录是仓库内 `.data/`。Windows 团队开发优先使用上述 CMD 启动器，以获得平台隔离的数据目录和端口处理。
 
 ## 本地生产模式
 
@@ -48,11 +95,13 @@ npm start
 - 正式提交要求再次勾选确认，先创建 `.data/writeback-checkpoints/`，再写入正文与追踪账本；源文件变化会阻塞提交。
 - 正式正文字节级来自作者已确认候选，追踪同步模型只提取摘要、角色、伏笔、时间线和下一章目标。
 
-## 生产部署
+## Linux 生产部署
 
 当前生产拓扑是**单用户、单实例、文件存储**。应用端口默认仅发布到宿主机
 `127.0.0.1`；远程访问必须经过 TLS 与身份认证代理。完整部署、备份、恢复、
 升级和回滚步骤见 [`docs/production-runbook.md`](docs/production-runbook.md)。
+
+`deploy/*.sh`、Docker 和 Compose 属于 Linux 生产部署层，不是 Windows 本地开发依赖。
 
 生产发布门禁：
 
