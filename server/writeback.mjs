@@ -626,6 +626,8 @@ async function writeFileDurable(file, value) {
   }
 }
 async function syncDirectory(directory) {
+  // Windows does not support fsync on directory handles.
+  if (process.platform === 'win32') return;
   let handle;
   try {
     handle = await fs.open(directory, 'r');
