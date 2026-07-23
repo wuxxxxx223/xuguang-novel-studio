@@ -16,3 +16,6 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+
+# Local Windows runtime data, locks, workspaces, and credentials
+windows-runtime/

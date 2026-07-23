@@ -25,6 +25,12 @@ try {
   await fs.mkdir(dataDir, { recursive: true });
   const mockPort = await freePort();
   mockServer = http.createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      assert.match(String(req.headers.authorization ?? ''), /^Bearer /);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'mock-writer-a' }, { id: 'mock-writer-b' }] }));
+      return;
+    }
     let body = '';
     for await (const chunk of req) body += chunk;
     lastModelRequest = JSON.parse(body || '{}');
@@ -62,6 +68,14 @@ try {
   child.stdout.on('data', (chunk) => { output += chunk; });
   child.stderr.on('data', (chunk) => { output += chunk; });
   await waitFor(async () => (await fetch(`${baseUrl}/api/health`)).ok, 8_000, 'workspace cycle API server');
+
+  const discoverResponse = await fetch(`${baseUrl}/api/models/discover`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ providerId: 'mock-provider' }),
+  });
+  assert.equal(discoverResponse.status, 200, 'model discovery endpoint should query the configured provider');
+  const discovered = await discoverResponse.json();
+  assert.deepEqual(discovered.models, ['mock-writer-a', 'mock-writer-b']);
 
   let workspace = await getWorkspace();
   const contract = {
@@ -127,6 +141,82 @@ try {
   assert.equal(confirmed.response.status, 200);
   workspace = confirmed.payload.workspace;
 
+  const reopened = await putWorkspace({
+    ...workspace,
+    currentChapter: {
+      ...workspace.currentChapter,
+      contract: {
+        ...workspace.currentChapter.contract,
+        status: 'suggested',
+        candidate: contract,
+        confirmed: null,
+        source: { kind: 'author-contract-revision', reopenedAt: '2026-07-17T00:03:00.000Z' },
+        proposedAt: '2026-07-17T00:03:00.000Z',
+        confirmedAt: null,
+      },
+    },
+  }, workspace.revision);
+  assert.equal(reopened.response.status, 200, '已确认契约应允许通过显式修订动作重新打开');
+  workspace = reopened.payload.workspace;
+
+  const noHookContract = { ...contract, chapterEndHook: '' };
+  const editedRevision = await putWorkspace({
+    ...workspace,
+    currentChapter: {
+      ...workspace.currentChapter,
+      contract: { ...workspace.currentChapter.contract, candidate: noHookContract },
+    },
+  }, workspace.revision);
+  assert.equal(editedRevision.response.status, 200, '重新打开后应允许清空章末钩子');
+  workspace = editedRevision.payload.workspace;
+
+  const reconfirmed = await putWorkspace({
+    ...workspace,
+    currentChapter: {
+      ...workspace.currentChapter,
+      contract: { ...workspace.currentChapter.contract, status: 'confirmed', confirmed: noHookContract, confirmedAt: '2026-07-17T00:04:00.000Z' },
+    },
+  }, workspace.revision);
+  assert.equal(reconfirmed.response.status, 200, '修改后的契约仍须再次明确确认');
+  workspace = reconfirmed.payload.workspace;
+
+  const outline = {
+    chapterId: '1',
+    title: '雨夜开门',
+    storySummary: '主角在雨夜确认访客身份并拿到密信。',
+    opening: '雨夜有人敲门。',
+    storySections: [
+      { id: 'scene-1', title: '门外来客', whatHappens: '主角隔门确认来客身份。' },
+      { id: 'scene-2', title: '交换密信', whatHappens: '主角承担暴露风险拿到密信。' },
+      { id: 'scene-3', title: '自然收束', whatHappens: '来客离开，主角开始检查密信。' },
+    ],
+    ending: '',
+    openQuestions: [],
+  };
+  const outlined = await putWorkspace({
+    ...workspace,
+    stages: {
+      ...workspace.stages,
+      draft: {
+        ...workspace.stages.draft,
+        chapterOutline: {
+          status: 'confirmed', suggestion: outline, confirmed: outline, feedback: '',
+          annotations: { 'scene-2': { title: 'scene 2', instruction: 'strengthen the rescue' } },
+          iterations: [{ id: 'outline-v1', version: 1, suggestion: outline, feedback: 'initial', model: 'mock-outline' }],
+        },
+        generationTargets: [
+          { id: 'target-a', providerId: 'mock-provider', model: 'mock-writer-a', enabled: true },
+          { id: 'target-b', providerId: 'mock-provider', model: 'mock-writer-b', enabled: true },
+        ],
+      },
+    },
+  }, workspace.revision);
+  assert.equal(outlined.response.status, 200, '正文生成前应保存并确认章节大纲');
+  workspace = outlined.payload.workspace;
+  assert.equal(workspace.stages.draft.chapterOutline.annotations['scene-2'].instruction, 'strengthen the rescue');
+  assert.equal(workspace.stages.draft.chapterOutline.iterations.length, 1);
+  assert.equal(workspace.stages.draft.generationTargets.length, 2);
+
   const writerResponse = await fetch(`${baseUrl}/api/ai/generate`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -148,6 +238,24 @@ try {
   assert.equal(writerPayload.context.currentChapter.number, 1);
   assert.equal(writerPayload.context.upstream.blueprint.nextChapterContractCandidate, undefined, 'writer 上下文不能把蓝图候选当作当前章事实');
   assert.equal(writerPayload.confirmedChapterContract.chapterNumber, 1);
+  assert.equal(writerPayload.confirmedChapterContract.chapterEndHook, '', 'writer 必须读取作者清空钩子后的最新确认契约');
+
+  const batchResponse = await fetch(`${baseUrl}/api/ai/generate-batch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      stage: 'draft', writingMode: 'draft', workspace, input: '', context: {}, chapterId: 1,
+      targets: [
+        { id: 'candidate-a', providerId: 'mock-provider', model: 'mock-writer-a', enabled: true },
+        { id: 'candidate-b', providerId: 'mock-provider', model: 'mock-writer-b', enabled: true },
+      ],
+    }),
+  });
+  const batchPayload = await batchResponse.json();
+  assert.equal(batchResponse.status, 200, 'parallel writer endpoint should accept multiple models');
+  assert.equal(batchPayload.results.length, 2);
+  assert.equal(batchPayload.results.filter((item) => item.ok).length, 2);
+  assert.deepEqual(batchPayload.results.map((item) => item.targetId), ['candidate-a', 'candidate-b']);
 
   const forgedReviewResponse = await fetch(`${baseUrl}/api/ai/generate`, {
     method: 'POST',
@@ -170,7 +278,7 @@ try {
   assert.equal(forgedReview.error.code, 'REVIEW_DRAFT_REQUIRED');
 
   const incompleteHistory = {
-    ...completedHistoryEntry(workspace, contract),
+    ...completedHistoryEntry(workspace, noHookContract),
     draft: { value: '尚未由作者确认的正文', confirmedAt: null },
     review: { value: { verdict: '尚未采纳' }, confirmedAt: null },
   };
@@ -203,7 +311,7 @@ try {
   assert.equal(readyCurrent.response.status, 200);
   workspace = readyCurrent.payload.workspace;
 
-  const archived = completedHistoryEntry(workspace, contract);
+  const archived = completedHistoryEntry(workspace, noHookContract);
   const advanced = await putWorkspace({
     ...workspace,
     chapterHistory: [archived],

@@ -32,6 +32,7 @@ const stageDefaults = {
     status: 'empty',
     input: { desire: '', resistance: '', stakes: '', escalation: '', mystery: '' },
     suggestion: null,
+    refinementFeedback: '',
     confirmed: null,
   },
   blueprint: {
@@ -40,7 +41,18 @@ const stageDefaults = {
     suggestion: null,
     confirmed: null,
   },
-  draft: { status: 'empty', text: '', suggestion: null, confirmed: null },
+  draft: {
+    status: 'empty',
+    text: '',
+    suggestion: null,
+    chapterOutline: { status: 'empty', suggestion: null, confirmed: null, feedback: '', annotations: {}, iterations: [], error: null, updatedAt: null },
+    generationNotes: { minChars: 2000, targetChars: 2500, maxChars: 3000, style: '', sectionInstructions: {} },
+    generationTargets: [],
+    candidates: [],
+    selectedCandidateId: '',
+    paragraphAnnotations: [],
+    confirmed: null,
+  },
   review: { status: 'empty', input: { focus: '' }, suggestion: null, confirmed: null, findings: [], accepted: false },
 };
 
@@ -67,6 +79,8 @@ export function createWorkspace() {
     currentStage: 'idea',
     chapterCycleVersion: CHAPTER_CYCLE_VERSION,
     chapterHistory: [],
+    chapterRevisions: [],
+    activeChapterRevision: null,
     currentChapter: createCurrentChapter(1),
     stages: structuredCloneSafe(stageDefaults),
     runs: [],
@@ -97,6 +111,14 @@ export function normalizeWorkspace(payload) {
           ...(incoming.draw && typeof incoming.draw === 'object' ? incoming.draw : {}),
         },
       } : {}),
+      ...(stage.id === 'draft' ? {
+        chapterOutline: normalizeChapterOutline(incoming.chapterOutline),
+        generationNotes: normalizeDraftGenerationNotes(incoming.generationNotes),
+        generationTargets: normalizeDraftGenerationTargets(incoming.generationTargets),
+        candidates: normalizeDraftCandidates(incoming.candidates),
+        selectedCandidateId: String(incoming.selectedCandidateId ?? '').slice(0, 120),
+        paragraphAnnotations: normalizeParagraphAnnotations(incoming.paragraphAnnotations),
+      } : {}),
     };
   }
 
@@ -108,10 +130,132 @@ export function normalizeWorkspace(payload) {
     currentStage: STAGES.some((stage) => stage.id === raw.currentStage) ? raw.currentStage : 'idea',
     chapterCycleVersion,
     chapterHistory: Array.isArray(raw.chapterHistory) ? raw.chapterHistory.map((entry) => structuredCloneSafe(entry)) : [],
+    chapterRevisions: Array.isArray(raw.chapterRevisions) ? raw.chapterRevisions.map((entry) => structuredCloneSafe(entry)) : [],
+    activeChapterRevision: raw.activeChapterRevision && typeof raw.activeChapterRevision === 'object'
+      ? structuredCloneSafe(raw.activeChapterRevision)
+      : null,
     currentChapter: normalizeCurrentChapter(raw.currentChapter, chapterCycleVersion),
     stages,
     runs: Array.isArray(raw.runs) ? raw.runs : [],
   };
+}
+
+function normalizeChapterOutline(value) {
+  const incoming = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const status = ['empty', 'generating', 'suggested', 'confirmed', 'error'].includes(incoming.status)
+    ? incoming.status
+    : 'empty';
+  return {
+    status: status === 'generating' ? 'suggested' : status,
+    suggestion: incoming.suggestion ?? null,
+    confirmed: incoming.confirmed ?? null,
+    feedback: String(incoming.feedback ?? ''),
+    annotations: normalizeOutlineAnnotations(incoming.annotations),
+    iterations: Array.isArray(incoming.iterations) ? incoming.iterations.slice(-20).map((item, index) => ({
+      id: String(item?.id ?? `outline-v${index + 1}`),
+      version: Math.max(1, Number.parseInt(item?.version, 10) || index + 1),
+      suggestion: structuredCloneSafe(item?.suggestion ?? null),
+      feedback: String(item?.feedback ?? ''),
+      createdAt: item?.createdAt ?? null,
+      providerName: String(item?.providerName ?? ''),
+      model: String(item?.model ?? ''),
+    })) : [],
+    error: incoming.error && typeof incoming.error === 'object' ? incoming.error : null,
+    updatedAt: incoming.updatedAt ?? null,
+    confirmedAt: incoming.confirmedAt ?? null,
+  };
+}
+
+function normalizeOutlineAnnotations(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).slice(0, 40).map(([key, item]) => {
+    const incoming = item && typeof item === 'object' && !Array.isArray(item) ? item : { instruction: item };
+    return [String(key).slice(0, 120), { title: String(incoming.title ?? '').slice(0, 200), instruction: String(incoming.instruction ?? '').slice(0, 4000) }];
+  }));
+}
+
+function normalizeDraftGenerationTargets(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 6).map((item, index) => ({
+    id: String(item?.id ?? `target-${index + 1}`).slice(0, 120),
+    providerId: String(item?.providerId ?? '').slice(0, 64),
+    model: String(item?.model ?? '').slice(0, 200),
+    enabled: item?.enabled !== false,
+  }));
+}
+
+function normalizeDraftCandidates(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-12).map((item, index) => ({
+    id: String(item?.id ?? `candidate-${index + 1}`).slice(0, 120),
+    targetId: String(item?.targetId ?? '').slice(0, 120),
+    providerId: String(item?.providerId ?? '').slice(0, 64),
+    providerName: String(item?.providerName ?? '').slice(0, 120),
+    model: String(item?.model ?? '').slice(0, 200),
+    status: ['generating', 'ready', 'error'].includes(item?.status) ? item.status : 'error',
+    suggestion: structuredCloneSafe(item?.suggestion ?? null),
+    error: item?.error ? { message: String(item.error.message ?? item.error).slice(0, 1000) } : null,
+    latencyMs: Math.max(0, Number(item?.latencyMs) || 0),
+    createdAt: item?.createdAt ?? null,
+  }));
+}
+
+function normalizeDraftGenerationNotes(value) {
+  const incoming = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const minChars = Math.min(10000, Math.max(500, Number.parseInt(incoming.minChars, 10) || 2000));
+  const maxChars = Math.min(12000, Math.max(minChars + 200, Number.parseInt(incoming.maxChars, 10) || 3000));
+  const requestedTarget = Number.parseInt(incoming.targetChars, 10);
+  const targetChars = Number.isFinite(requestedTarget)
+    ? Math.min(maxChars, Math.max(minChars, requestedTarget))
+    : Math.round((minChars + maxChars) / 2);
+  return {
+    minChars,
+    targetChars,
+    maxChars,
+    style: String(incoming.style ?? '').slice(0, 6000),
+    sectionInstructions: normalizeSectionInstructions(incoming.sectionInstructions),
+  };
+}
+
+function normalizeSectionInstructions(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).slice(0, 40).map(([key, item]) => {
+    const incoming = item && typeof item === 'object' && !Array.isArray(item) ? item : { instruction: item };
+    return [String(key).slice(0, 120), {
+      title: String(incoming.title ?? '').slice(0, 200),
+      instruction: String(incoming.instruction ?? '').slice(0, 2000),
+      lengthMode: normalizeSectionLengthMode(incoming.lengthMode),
+    }];
+  }));
+}
+
+function normalizeSectionLengthMode(value) {
+  return ['short', 'normal', 'long', 'focus'].includes(value) ? value : 'normal';
+}
+
+function normalizeParagraphAnnotations(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-200).map((annotation, index) => {
+    const status = ['editing', 'ready', 'error', 'applied'].includes(annotation?.status)
+      ? annotation.status
+      : 'editing';
+    return {
+      id: String(annotation?.id ?? `paragraph-note-${index + 1}`),
+      paragraphIndex: Math.max(0, Number.parseInt(annotation?.paragraphIndex, 10) || 0),
+      sourceText: String(annotation?.sourceText ?? ''),
+      instruction: String(annotation?.instruction ?? ''),
+      status,
+      candidate: String(annotation?.candidate ?? ''),
+      changeSummary: String(annotation?.changeSummary ?? ''),
+      continuityWarnings: Array.isArray(annotation?.continuityWarnings) ? annotation.continuityWarnings : [],
+      error: annotation?.error && typeof annotation.error === 'object' ? annotation.error : null,
+      createdAt: annotation?.createdAt ?? null,
+      updatedAt: annotation?.updatedAt ?? null,
+      appliedAt: annotation?.appliedAt ?? null,
+      model: String(annotation?.model ?? ''),
+      provider: String(annotation?.provider ?? ''),
+    };
+  });
 }
 
 export function isChapterCycleWorkspace(workspace) {
@@ -193,6 +337,38 @@ export function updateCurrentChapterContractCandidate(workspace, candidate, time
   };
 }
 
+export function reopenCurrentChapterContract(workspace, timestamp = new Date().toISOString()) {
+  if (!isChapterCycleWorkspace(workspace)) return null;
+  const currentChapter = normalizeCurrentChapter(workspace.currentChapter, CHAPTER_CYCLE_VERSION);
+  const currentContract = currentChapter.contract;
+  if (currentContract.status !== 'confirmed' || !hasContractContent(currentContract.confirmed)) return null;
+  const revisions = Array.isArray(currentContract.revisions) ? currentContract.revisions : [];
+  return {
+    ...workspace,
+    currentChapter: {
+      ...currentChapter,
+      contract: {
+        ...currentContract,
+        status: 'suggested',
+        candidate: structuredCloneSafe(currentContract.confirmed),
+        confirmed: null,
+        source: {
+          kind: 'author-contract-revision',
+          previousSource: structuredCloneSafe(currentContract.source),
+          reopenedAt: timestamp,
+        },
+        revisions: [...revisions, {
+          value: structuredCloneSafe(currentContract.confirmed),
+          confirmedAt: currentContract.confirmedAt,
+          reopenedAt: timestamp,
+        }].slice(-20),
+        proposedAt: timestamp,
+        confirmedAt: null,
+      },
+    },
+  };
+}
+
 export function confirmCurrentChapterContract(workspace, timestamp = new Date().toISOString()) {
   if (!canConfirmCurrentChapterContract(workspace)) return null;
   const currentChapter = normalizeCurrentChapter(workspace.currentChapter, CHAPTER_CYCLE_VERSION);
@@ -268,6 +444,69 @@ export function prepareNextWorkspaceChapter(workspace, timestamp = new Date().to
   return prepareCurrentChapterContract(next, timestamp);
 }
 
+export function beginArchivedChapterRevision(workspace, chapterNumber, timestamp = new Date().toISOString()) {
+  const number = Number(chapterNumber);
+  const archived = (Array.isArray(workspace?.chapterHistory) ? workspace.chapterHistory : [])
+    .find((entry) => Number(entry?.chapterNumber) === number);
+  if (!archived) return null;
+  const revisions = (Array.isArray(workspace?.chapterRevisions) ? workspace.chapterRevisions : [])
+    .filter((entry) => Number(entry?.chapterNumber) === number);
+  const latest = revisions.at(-1);
+  const sourceDraft = latest?.draft?.value ?? archived.draft?.value;
+  if (sourceDraft == null) return null;
+  return {
+    ...workspace,
+    activeChapterRevision: {
+      chapterNumber: number,
+      title: latest?.title ?? archived.title ?? `第 ${number} 章`,
+      sourceCompletedAt: archived.completedAt ?? null,
+      sourceRevisionId: latest?.revisionId ?? null,
+      originalDraft: structuredCloneSafe(sourceDraft),
+      draft: structuredCloneSafe(sourceDraft),
+      startedAt: timestamp,
+    },
+  };
+}
+
+export function updateArchivedChapterRevision(workspace, draft) {
+  if (!workspace?.activeChapterRevision) return workspace;
+  return {
+    ...workspace,
+    activeChapterRevision: {
+      ...workspace.activeChapterRevision,
+      draft: structuredCloneSafe(draft),
+    },
+  };
+}
+
+export function cancelArchivedChapterRevision(workspace) {
+  return workspace?.activeChapterRevision ? { ...workspace, activeChapterRevision: null } : workspace;
+}
+
+export function confirmArchivedChapterRevision(workspace, timestamp = new Date().toISOString()) {
+  const active = workspace?.activeChapterRevision;
+  if (!active || !String(active.draft ?? '').trim()) return null;
+  const revisions = Array.isArray(workspace.chapterRevisions) ? workspace.chapterRevisions : [];
+  const revisionNumber = revisions.filter((entry) => Number(entry?.chapterNumber) === Number(active.chapterNumber)).length + 1;
+  const revision = {
+    schemaVersion: 1,
+    revisionId: `chapter-${active.chapterNumber}-revision-${revisionNumber}`,
+    revisionNumber,
+    chapterNumber: Number(active.chapterNumber),
+    title: active.title || `第 ${active.chapterNumber} 章`,
+    sourceCompletedAt: active.sourceCompletedAt ?? null,
+    sourceRevisionId: active.sourceRevisionId ?? null,
+    draft: { value: structuredCloneSafe(active.draft), confirmedAt: timestamp },
+    completedAt: timestamp,
+    formalWritePerformed: false,
+  };
+  return {
+    ...workspace,
+    chapterRevisions: [...revisions, revision],
+    activeChapterRevision: null,
+  };
+}
+
 export function createSettings() {
   const providerId = 'provider-default';
   return {
@@ -282,9 +521,10 @@ export function createSettings() {
         hasApiKey: false,
         apiKeyMasked: '',
         configured: false,
+        models: [],
       },
     ],
-    routes: Object.fromEntries(['idea', 'logic', 'blueprint', 'writer', 'review'].map((role) => [role, { providerId, model: '' }])),
+    routes: Object.fromEntries(['idea', 'logic', 'blueprint', 'outline', 'writer', 'review'].map((role) => [role, { providerId, model: '' }])),
     temperature: 0.7,
     jsonMode: true,
   };
@@ -319,20 +559,22 @@ export function normalizeSettings(payload) {
       hasApiKey,
       apiKeyMasked: masked || (hasApiKey ? '••••••••' : ''),
       configured: Boolean(provider.configured ?? (baseUrl && hasApiKey)),
+      models: [...new Set((Array.isArray(provider.models) ? provider.models : []).map((model) => String(model ?? '').trim()).filter(Boolean))],
     };
   });
   const firstProviderId = providers[0]?.id ?? '';
   const modelInputs = raw.models ?? raw.modelByStage ?? {};
   const routeInputs = raw.routes ?? {};
   const routes = {};
-  for (const role of ['idea', 'logic', 'blueprint', 'writer', 'review']) {
+  for (const role of ['idea', 'logic', 'blueprint', 'outline', 'writer', 'review']) {
     const legacyRole = role === 'writer' ? 'draft' : role;
-    const incoming = routeInputs[role] ?? routeInputs[legacyRole];
+    const incoming = routeInputs[role] ?? routeInputs[legacyRole] ?? (role === 'outline' ? routeInputs.logic : undefined);
+    const fallbackRoute = role === 'outline' ? routes.logic : null;
     routes[role] = {
-      providerId: String((incoming && typeof incoming === 'object' ? incoming.providerId : '') ?? firstProviderId).trim() || firstProviderId,
+      providerId: String(incoming && typeof incoming === 'object' ? incoming.providerId : fallbackRoute?.providerId ?? firstProviderId).trim() || firstProviderId,
       model: String(
         (incoming && typeof incoming === 'object' ? incoming.model : incoming) ??
-        modelInputs[role] ?? modelInputs[legacyRole] ?? raw[role + 'Model'] ?? ''
+        modelInputs[role] ?? modelInputs[legacyRole] ?? (role === 'outline' ? routes.logic?.model : undefined) ?? raw[role + 'Model'] ?? ''
       ).trim(),
     };
   }
@@ -732,4 +974,3 @@ function structuredCloneSafe(value) {
   if (typeof structuredClone === 'function') return structuredClone(value);
   return JSON.parse(JSON.stringify(value));
 }
-

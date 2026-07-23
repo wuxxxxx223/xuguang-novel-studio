@@ -9,6 +9,7 @@ import {
   normalizeWorkspace,
   prepareCurrentChapterContract,
   prepareNextWorkspaceChapter,
+  reopenCurrentChapterContract,
   updateCurrentChapterContractCandidate,
 } from '../web/src/state.js';
 
@@ -64,6 +65,18 @@ workspace = confirmCurrentChapterContract(workspace, '2026-07-17T00:02:00.000Z')
 assert.ok(workspace, '作者补全候选后应能明确确认当前章契约');
 assert.equal(workspace.currentChapter.contract.status, 'confirmed');
 assert.deepEqual(getConfirmedCurrentChapterContract(workspace), workspace.currentChapter.contract.confirmed);
+
+const firstConfirmedContract = structuredClone(workspace.currentChapter.contract.confirmed);
+workspace = reopenCurrentChapterContract(workspace, '2026-07-17T00:02:30.000Z');
+assert.equal(workspace.currentChapter.contract.status, 'suggested', '已确认契约必须通过显式修订动作重新进入待确认状态');
+assert.deepEqual(workspace.currentChapter.contract.candidate, firstConfirmedContract, '修订必须从上一份作者确认稿开始');
+assert.deepEqual(workspace.currentChapter.contract.revisions.at(-1).value, firstConfirmedContract, '重新打开时必须保留上一份确认稿快照');
+workspace = updateCurrentChapterContractCandidate(workspace, {
+  ...workspace.currentChapter.contract.candidate,
+  chapterEndHook: '',
+}, '2026-07-17T00:02:40.000Z');
+workspace = confirmCurrentChapterContract(workspace, '2026-07-17T00:02:50.000Z');
+assert.equal(workspace.currentChapter.contract.confirmed.chapterEndHook, '', '作者应能明确移除章末钩子后重新确认契约');
 
 workspace = {
   ...workspace,

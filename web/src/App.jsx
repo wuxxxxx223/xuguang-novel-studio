@@ -8,8 +8,8 @@ import {
   Server, Settings2, ShieldAlert, Sparkles, Trash2, X,
 } from 'lucide-react';
 import {
-  ApiError, activateWorkspace, commitProjectChapterWriteBack, commitProjectContractDraft, confirmProjectChapterDraft, createWorkspaceRecord,
-  generateProjectChapterDraft, generateProjectContractDraft, generateWithAI,
+  ApiError, activateWorkspace, commitProjectChapterWriteBack, commitProjectContractDraft, confirmProjectChapterDraft, createWorkspaceRecord, discoverProviderModels,
+  generateDraftBatch, generateProjectChapterDraft, generateProjectContractDraft, generateWithAI,
   getProjectChapterWorkspace, getProjectDashboard, getProjects, getSettings, getWorkspace, getWorkspaces,
   prepareProjectChapterWriteBack, prepareProjectContractDraft, reviewProjectChapterDraft, saveProjectChapterWorkspace, saveProjectContractDraft,
   saveSettings, saveWorkspace, testModelConnection,
@@ -21,7 +21,7 @@ import {
   getConfirmedCurrentChapterContract, getCurrentChapterContractCandidate, getModelRoute, getNextStage,
   getPreviousStage, getStage, getStageIndex, hasConfirmedCurrentChapterContract, humanizeKey,
   isChapterCycleWorkspace, markDownstreamStale, normalizeSettings, normalizeWorkspace,
-  prepareCurrentChapterContract, prepareNextWorkspaceChapter, summarizeArtifact, tryParseJson,
+  prepareCurrentChapterContract, prepareNextWorkspaceChapter, reopenCurrentChapterContract, summarizeArtifact, tryParseJson,
   updateCurrentChapterContractCandidate, valueToText,
 } from './state.js';
 import { ProjectChapterWorkspace, ProjectContractWorkspace, ProjectInspector, ProjectModelLab, ProjectReviewWorkspace, ProjectTodayWorkspace, ProjectWriteBackWorkspace } from './ProjectDashboard.jsx';
@@ -88,6 +88,7 @@ const MODEL_ROWS = [
   { key: 'idea', label: 'Idea 模型', description: '高概念与读者承诺' },
   { key: 'logic', label: '逻辑模型', description: '因果、升级链与悬念' },
   { key: 'blueprint', label: '蓝图模型', description: '角色、卷纲与章节契约' },
+  { key: 'outline', label: '章节大纲模型', description: '正文前的场景规划与情节讨论' },
   { key: 'writer', label: '写作模型', description: '章节正文候选' },
   { key: 'review', label: '审查模型', description: '问题诊断与修改建议' },
 ];
@@ -308,6 +309,7 @@ export default function App() {
   const projectFindingRisks = projectFindings.filter((item) => ['P0', 'P1'].includes(String(item?.severity ?? item?.priority ?? '').toUpperCase())).length;
   const riskCount = projectDashboard && projectViews.includes(view) ? projectDashboard.risks.length + projectFindingRisks : countRisks(workspace, settings);
   const logicReady = getModelRoute(settings, 'logic').configured;
+  const outlineReady = getModelRoute(settings, 'outline').configured;
   const writerRoute = getModelRoute(settings, 'writer');
   const writerReady = writerRoute.configured;
   const reviewReady = getModelRoute(settings, 'review').configured;
@@ -610,12 +612,559 @@ export default function App() {
     });
   }, [updateWorkspace]);
 
+  const updateDraftAnnotations = useCallback((updater) => {
+    updateWorkspace((current) => {
+      const annotations = Array.isArray(current.stages.draft.paragraphAnnotations)
+        ? current.stages.draft.paragraphAnnotations
+        : [];
+      const nextAnnotations = typeof updater === 'function' ? updater(annotations) : updater;
+      return {
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...current.stages.draft,
+            paragraphAnnotations: Array.isArray(nextAnnotations) ? nextAnnotations.slice(-200) : annotations,
+          },
+        },
+      };
+    });
+  }, [updateWorkspace]);
+
+  const updateChapterOutlineFeedback = useCallback((feedback) => {
+    updateWorkspace((current) => ({
+      ...current,
+      stages: {
+        ...current.stages,
+        draft: {
+          ...current.stages.draft,
+          chapterOutline: {
+            ...current.stages.draft.chapterOutline,
+            feedback,
+          },
+        },
+      },
+    }));
+  }, [updateWorkspace]);
+
+  const updateChapterOutlineAnnotations = useCallback((annotations) => {
+    updateWorkspace((current) => {
+      const outline = current.stages.draft.chapterOutline ?? {};
+      const nextAnnotations = typeof annotations === 'function' ? annotations(outline.annotations ?? {}) : annotations;
+      const suggestion = outline.suggestion ?? outline.confirmed;
+      return {
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...current.stages.draft,
+            chapterOutline: {
+              ...outline,
+              status: suggestion ? 'suggested' : outline.status,
+              suggestion,
+              annotations: nextAnnotations && typeof nextAnnotations === 'object' ? nextAnnotations : {},
+              error: null,
+              updatedAt: new Date().toISOString(),
+            },
+            ...(current.stages.draft.suggestion != null ? { status: 'stale', staleFrom: 'chapter-outline' } : {}),
+          },
+        },
+      };
+    });
+  }, [updateWorkspace]);
+
+  const restoreChapterOutlineIteration = useCallback((iteration) => {
+    if (!iteration?.suggestion) return;
+    updateWorkspace((current) => ({
+      ...current,
+      stages: {
+        ...current.stages,
+        draft: {
+          ...current.stages.draft,
+          chapterOutline: {
+            ...current.stages.draft.chapterOutline,
+            status: 'suggested',
+            suggestion: cloneValue(iteration.suggestion),
+            annotations: {},
+            feedback: '',
+            error: null,
+            updatedAt: new Date().toISOString(),
+          },
+          ...(current.stages.draft.suggestion != null ? { status: 'stale', staleFrom: 'chapter-outline' } : {}),
+        },
+      },
+    }));
+    notify(`已恢复情节大纲第 ${iteration.version} 版，历史版本仍然保留`, 'success');
+  }, [notify, updateWorkspace]);
+
+  const updateDraftGenerationTargets = useCallback((targets) => {
+    updateWorkspace((current) => ({
+      ...current,
+      stages: {
+        ...current.stages,
+        draft: { ...current.stages.draft, generationTargets: Array.isArray(targets) ? targets.slice(0, 6) : [] },
+      },
+    }));
+  }, [updateWorkspace]);
+
+  const adoptDraftCandidate = useCallback((candidateId) => {
+    updateWorkspace((current) => {
+      const candidate = (current.stages.draft.candidates ?? []).find((item) => item.id === candidateId && item.status === 'ready');
+      if (!candidate?.suggestion) return current;
+      return {
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...current.stages.draft,
+            status: 'suggested',
+            suggestion: cloneValue(candidate.suggestion),
+            selectedCandidateId: candidate.id,
+            paragraphAnnotations: [],
+            error: null,
+          },
+        },
+      };
+    });
+    notify('已把该模型版本设为当前正文候选，其他模型结果仍然保留用于对比', 'success');
+  }, [notify, updateWorkspace]);
+
+  const updateChapterOutlineValue = useCallback((nextValue, removedSectionId = '') => {
+    updateWorkspace((current) => {
+      const draft = current.stages.draft;
+      const outline = draft.chapterOutline ?? { status: 'empty', suggestion: null, confirmed: null, feedback: '', error: null };
+      const generationNotes = normalizeDraftGenerationNotes(draft.generationNotes);
+      const sectionInstructions = { ...(generationNotes.sectionInstructions ?? {}) };
+      if (removedSectionId) delete sectionInstructions[removedSectionId];
+      const hasDraftCandidate = draft.suggestion != null;
+      const hasReviewArtifact = current.stages.review
+        && (current.stages.review.status !== 'empty'
+          || current.stages.review.suggestion != null
+          || current.stages.review.confirmed != null);
+      const now = new Date().toISOString();
+      return {
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...draft,
+            chapterOutline: {
+              ...outline,
+              status: 'suggested',
+              suggestion: cloneValue(nextValue),
+              error: null,
+              updatedAt: now,
+            },
+            generationNotes: { ...generationNotes, sectionInstructions },
+            ...(hasDraftCandidate ? { status: 'stale', staleFrom: 'chapter-outline' } : {}),
+          },
+          ...(hasReviewArtifact ? {
+            review: { ...current.stages.review, status: 'stale', staleFrom: 'draft', accepted: false },
+          } : {}),
+        },
+      };
+    });
+    notify('已从当前大纲删除该情节；已有正文和旧确认稿仍然保留', 'success');
+  }, [notify, updateWorkspace]);
+
+  const updateDraftGenerationNotes = useCallback((generationNotes) => {
+    updateWorkspace((current) => {
+      const nextNotes = normalizeDraftGenerationNotes(generationNotes);
+      const changed = !sameJsonValue(current.stages.draft.generationNotes, nextNotes);
+      if (!changed) return current;
+      const hasDraftCandidate = current.stages.draft.suggestion != null;
+      const hasReviewArtifact = current.stages.review
+        && (current.stages.review.status !== 'empty'
+          || current.stages.review.suggestion != null
+          || current.stages.review.confirmed != null);
+      return {
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...current.stages.draft,
+            generationNotes: nextNotes,
+            ...(hasDraftCandidate ? { status: 'stale', staleFrom: 'draft-generation-notes' } : {}),
+          },
+          ...(hasReviewArtifact ? {
+            review: { ...current.stages.review, status: 'stale', staleFrom: 'draft', accepted: false },
+          } : {}),
+        },
+      };
+    });
+  }, [updateWorkspace]);
+
+  const deleteDraftParagraph = useCallback((paragraphIndex, expectedText) => {
+    const snapshot = workspaceRef.current;
+    const preview = deleteSuggestionParagraph(
+      snapshot.stages.draft.suggestion,
+      paragraphIndex,
+      expectedText,
+      snapshot.currentChapter,
+    );
+    if (preview == null) {
+      notify('正文已经发生变化，没有删除这个段落，请刷新后重试', 'warning');
+      return;
+    }
+    updateWorkspace((current) => {
+      const draft = current.stages.draft;
+      const nextSuggestion = deleteSuggestionParagraph(
+        draft.suggestion,
+        paragraphIndex,
+        expectedText,
+        current.currentChapter,
+      );
+      if (nextSuggestion == null) return current;
+      const annotations = (Array.isArray(draft.paragraphAnnotations) ? draft.paragraphAnnotations : [])
+        .filter((item) => Number(item.paragraphIndex) !== paragraphIndex)
+        .map((item) => Number(item.paragraphIndex) > paragraphIndex
+          ? { ...item, paragraphIndex: Number(item.paragraphIndex) - 1, updatedAt: new Date().toISOString() }
+          : item);
+      const hasReviewArtifact = current.stages.review
+        && (current.stages.review.status !== 'empty'
+          || current.stages.review.suggestion != null
+          || current.stages.review.confirmed != null);
+      return {
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...draft,
+            suggestion: nextSuggestion,
+            paragraphAnnotations: annotations,
+            status: 'suggested',
+            error: null,
+          },
+          ...(hasReviewArtifact ? {
+            review: { ...current.stages.review, status: 'stale', staleFrom: 'draft', accepted: false },
+          } : {}),
+        },
+      };
+    });
+    notify(`已删除正文第 ${paragraphIndex + 1} 段，其余段落已重新编号`, 'success');
+  }, [notify, updateWorkspace]);
+
+  const generateChapterOutline = useCallback(async (mode = 'initial') => {
+    const snapshot = workspaceRef.current;
+    const outline = snapshot.stages.draft.chapterOutline ?? { status: 'empty', suggestion: null, confirmed: null, feedback: '' };
+    if (!getModelRoute(settings, 'outline').configured) {
+      setSettingsOpen(true);
+      notify('请先补全章节大纲模型配置', 'warning');
+      return;
+    }
+    if (!hasConfirmedCurrentChapterContract(snapshot)) {
+      notify(`请先确认第 ${snapshot.currentChapter?.number ?? 1} 章章节契约`, 'warning');
+      return;
+    }
+    const iterate = mode === 'iterate';
+    const annotationFeedback = Object.values(outline.annotations ?? {})
+      .filter((item) => String(item?.instruction ?? '').trim())
+      .map((item, index) => `情节批注 ${index + 1}（${item.title || '未命名情节'}）：${String(item.instruction).trim()}`)
+      .join('\n');
+    const feedback = [String(outline.feedback ?? '').trim(), annotationFeedback].filter(Boolean).join('\n\n');
+    if (iterate && outline.suggestion == null) {
+      notify('当前没有可继续讨论的章节大纲', 'warning');
+      return;
+    }
+    if (iterate && !feedback) {
+      notify('先写清楚这轮情节要保留、调整或加强什么', 'warning');
+      return;
+    }
+    const startedAt = Date.now();
+    const generatingSnapshot = {
+      ...snapshot,
+      stages: {
+        ...snapshot.stages,
+        draft: {
+          ...snapshot.stages.draft,
+          chapterOutline: {
+            ...outline,
+            status: 'generating',
+            error: null,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      },
+    };
+    updateWorkspace(generatingSnapshot);
+    const persisted = await persistWorkspace(generatingSnapshot, false);
+    if (!persisted) {
+      updateWorkspace((current) => updateChapterOutlineInWorkspace(current, (item) => ({
+        ...item,
+        status: 'error',
+        error: { message: '章节大纲保存失败，请解决保存冲突后重试' },
+      })));
+      return;
+    }
+    try {
+      const response = await generateWithAI({
+        stage: 'draft',
+        writingMode: 'outline',
+        workspace: generatingSnapshot,
+        input: null,
+        context: buildGenerationContext(generatingSnapshot, 'draft'),
+        refinement: iterate ? {
+          mode: 'chapter-outline-iterate',
+          feedback,
+          currentSuggestion: cloneValue(outline.suggestion),
+          history: (outline.iterations ?? []).slice(-6),
+        } : null,
+        chapterId: snapshot.currentChapter?.number ?? 1,
+      });
+      const suggestion = extractSuggestion(response);
+      if (!suggestion || typeof suggestion !== 'object' || Array.isArray(suggestion)) {
+        throw new Error('模型没有返回可用的章节情节大纲');
+      }
+      const run = buildRun({ stageId: 'draft', modelKey: 'outline', status: 'success', settings, startedAt, response });
+      updateWorkspace((current) => ({
+        ...updateChapterOutlineInWorkspace(current, (item) => ({
+          ...item,
+          status: 'suggested',
+          suggestion,
+          feedback: '',
+          annotations: {},
+          iterations: iterate && outline.suggestion ? [...(outline.iterations ?? []), {
+            id: `outline-v${(outline.iterations ?? []).length + 1}-${Date.now()}`,
+            version: (outline.iterations ?? []).length + 1,
+            suggestion: cloneValue(outline.suggestion),
+            feedback,
+            createdAt: new Date().toISOString(),
+            providerName: response?.providerName ?? '',
+            model: response?.model ?? '',
+          }].slice(-20) : outline.iterations ?? [],
+          error: null,
+          updatedAt: new Date().toISOString(),
+        })),
+        runs: [...(current.runs ?? []), run].slice(-30),
+      }));
+      notify(iterate ? '下一版章节情节大纲已返回，确认前不会生成正文' : '章节情节大纲已返回，请先讨论或确认', 'success');
+    } catch (error) {
+      const message = toErrorMessage(error);
+      const run = buildRun({ stageId: 'draft', modelKey: 'outline', status: 'error', settings, startedAt, error });
+      updateWorkspace((current) => ({
+        ...updateChapterOutlineInWorkspace(current, (item) => ({
+          ...item,
+          status: 'error',
+          feedback: feedback || item.feedback,
+          error: { message, at: new Date().toISOString() },
+          updatedAt: new Date().toISOString(),
+        })),
+        runs: [...(current.runs ?? []), run].slice(-30),
+      }));
+      notify(message, 'error');
+    }
+  }, [notify, persistWorkspace, settings, updateWorkspace]);
+
+  const confirmChapterOutline = useCallback(() => {
+    const currentOutline = workspaceRef.current.stages.draft.chapterOutline;
+    if (currentOutline?.suggestion == null) {
+      notify('当前没有可确认的章节情节大纲', 'warning');
+      return;
+    }
+    updateWorkspace((current) => {
+      const now = new Date().toISOString();
+      const outline = current.stages.draft.chapterOutline;
+      const hasDraftCandidate = current.stages.draft.suggestion != null;
+      const hasReviewArtifact = current.stages.review
+        && (current.stages.review.status !== 'empty'
+          || current.stages.review.suggestion != null
+          || current.stages.review.confirmed != null);
+      return {
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...current.stages.draft,
+            chapterOutline: {
+              ...outline,
+              status: 'confirmed',
+              confirmed: cloneValue(outline.suggestion),
+              feedback: '',
+              annotations: {},
+              error: null,
+              confirmedAt: now,
+              updatedAt: now,
+            },
+            ...(hasDraftCandidate ? { status: 'stale', staleFrom: 'chapter-outline' } : {}),
+          },
+          ...(hasReviewArtifact ? {
+            review: {
+              ...current.stages.review,
+              status: 'stale',
+              staleFrom: 'draft',
+              accepted: false,
+            },
+          } : {}),
+        },
+      };
+    });
+    const notes = normalizeDraftGenerationNotes(workspaceRef.current.stages.draft.generationNotes);
+    notify(`章节情节大纲已确认，现在可以按大纲生成 ${notes.minChars}–${notes.maxChars} 字正文`, 'success');
+  }, [notify, updateWorkspace]);
+
+  const rewriteDraftParagraph = useCallback(async (annotationId) => {
+    const snapshot = workspaceRef.current;
+    const artifact = snapshot.stages.draft;
+    const annotations = Array.isArray(artifact.paragraphAnnotations) ? artifact.paragraphAnnotations : [];
+    const annotation = annotations.find((item) => item.id === annotationId);
+    if (!annotation) return;
+    if (!getModelRoute(settings, 'writer').configured) {
+      setSettingsOpen(true);
+      notify('请先补全章节写作模型配置', 'warning');
+      return;
+    }
+    const instruction = String(annotation.instruction ?? '').trim();
+    if (!instruction) {
+      notify('请先写下这一段要如何修改', 'warning');
+      return;
+    }
+    const currentSuggestion = artifact.suggestion;
+    const paragraphs = splitDraftParagraphs(getDraftBody(currentSuggestion));
+    const paragraphIndex = Number(annotation.paragraphIndex);
+    if (currentSuggestion == null || paragraphs[paragraphIndex] !== String(annotation.sourceText ?? '').trim()) {
+      notify('目标段落已经变化，请重新添加批注', 'warning');
+      return;
+    }
+    const startedAt = Date.now();
+    const rewritingAt = new Date().toISOString();
+    const rewriteSnapshot = updateDraftAnnotationInWorkspace(snapshot, annotationId, (current) => ({
+      ...current,
+      status: 'rewriting',
+      candidate: '',
+      changeSummary: '',
+      continuityWarnings: [],
+      error: null,
+      updatedAt: rewritingAt,
+    }));
+    updateWorkspace(rewriteSnapshot);
+    const persisted = await persistWorkspace(rewriteSnapshot, false);
+    if (!persisted) {
+      updateDraftAnnotations((items) => updateDraftAnnotation(items, annotationId, (current) => ({
+        ...current,
+        status: 'error',
+        error: { message: '批注保存失败，请解决保存冲突后重试' },
+      })));
+      notify('批注保存失败，尚未调用模型', 'error');
+      return;
+    }
+    try {
+      const response = await generateWithAI({
+        stage: 'draft',
+        workspace: rewriteSnapshot,
+        input: artifact.text,
+        context: buildGenerationContext(rewriteSnapshot, 'draft'),
+        refinement: {
+          mode: 'paragraph-rewrite',
+          feedback: instruction,
+          currentSuggestion: cloneValue(currentSuggestion),
+          target: {
+            paragraphIndex,
+            paragraphText: annotation.sourceText,
+            before: paragraphs[paragraphIndex - 1] ?? '',
+            after: paragraphs[paragraphIndex + 1] ?? '',
+          },
+        },
+        chapterId: snapshot.currentChapter?.number ?? 1,
+      });
+      const result = extractParagraphRewrite(response);
+      const latest = workspaceRef.current;
+      const latestAnnotation = (latest.stages.draft.paragraphAnnotations ?? []).find((item) => item.id === annotationId);
+      const latestParagraphs = splitDraftParagraphs(getDraftBody(latest.stages.draft.suggestion));
+      if (!latestAnnotation || latestParagraphs[paragraphIndex] !== String(annotation.sourceText ?? '').trim()) {
+        updateDraftAnnotations((items) => updateDraftAnnotation(items, annotationId, (current) => ({
+          ...current,
+          status: 'error',
+          error: { message: '生成期间目标段落发生变化，请重新批注' },
+        })));
+        notify('生成期间目标段落发生变化，重写结果未覆盖正文', 'warning');
+        return;
+      }
+      const run = buildRun({ stageId: 'draft', status: 'success', settings, startedAt, response });
+      updateWorkspace((current) => ({
+        ...updateDraftAnnotationInWorkspace(current, annotationId, (item) => ({
+          ...item,
+          status: 'ready',
+          candidate: result.replacementParagraph,
+          changeSummary: result.changeSummary,
+          continuityWarnings: result.continuityWarnings,
+          error: null,
+          updatedAt: new Date().toISOString(),
+          model: response?.model ?? '',
+          provider: response?.providerName ?? '',
+        })),
+        runs: [...(current.runs ?? []), run].slice(-30),
+      }));
+      notify('段落重写候选已返回；采用前不会修改正文', 'success');
+    } catch (error) {
+      const message = toErrorMessage(error);
+      const run = buildRun({ stageId: 'draft', status: 'error', settings, startedAt, error });
+      updateWorkspace((current) => ({
+        ...updateDraftAnnotationInWorkspace(current, annotationId, (item) => ({
+          ...item,
+          status: 'error',
+          error: { message, at: new Date().toISOString() },
+          updatedAt: new Date().toISOString(),
+        })),
+        runs: [...(current.runs ?? []), run].slice(-30),
+      }));
+      notify(message, 'error');
+    }
+  }, [notify, persistWorkspace, settings, updateDraftAnnotations, updateWorkspace]);
+
+  const applyDraftParagraphRewrite = useCallback((annotationId) => {
+    const snapshot = workspaceRef.current;
+    const snapshotArtifact = snapshot.stages.draft;
+    const snapshotAnnotation = (snapshotArtifact.paragraphAnnotations ?? []).find((item) => item.id === annotationId);
+    const snapshotReplacement = snapshotAnnotation?.status === 'ready'
+      ? replaceSuggestionParagraph(snapshotArtifact.suggestion, Number(snapshotAnnotation.paragraphIndex), snapshotAnnotation.sourceText, snapshotAnnotation.candidate)
+      : null;
+    if (!snapshotAnnotation || !snapshotReplacement) {
+      notify('目标段落已经变化，请重新添加批注', 'warning');
+      return;
+    }
+    updateWorkspace((current) => {
+      const artifact = current.stages.draft;
+      const annotation = (artifact.paragraphAnnotations ?? []).find((item) => item.id === annotationId);
+      if (!annotation || annotation.status !== 'ready' || !String(annotation.candidate ?? '').trim()) return current;
+      const replaced = replaceSuggestionParagraph(
+        artifact.suggestion,
+        Number(annotation.paragraphIndex),
+        annotation.sourceText,
+        annotation.candidate,
+      );
+      if (!replaced) return current;
+      const next = updateDraftAnnotationInWorkspace({
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...artifact,
+            suggestion: replaced,
+            status: 'suggested',
+          },
+        },
+      }, annotationId, (item) => ({ ...item, status: 'applied', appliedAt: new Date().toISOString(), error: null }));
+      return markDownstreamStale(next, 'draft');
+    });
+    notify('已仅替换所选段落；整章其他内容保持不变', 'success');
+  }, [notify, updateWorkspace]);
+
   const updateIdeaFeedback = useCallback((feedback) => {
     updateWorkspace((current) => ({
       ...current,
       stages: {
         ...current.stages,
         idea: { ...current.stages.idea, refinementFeedback: feedback },
+      },
+    }));
+  }, [updateWorkspace]);
+
+  const updateLogicFeedback = useCallback((feedback) => {
+    updateWorkspace((current) => ({
+      ...current,
+      stages: {
+        ...current.stages,
+        logic: { ...current.stages.logic, refinementFeedback: feedback },
       },
     }));
   }, [updateWorkspace]);
@@ -663,8 +1212,95 @@ export default function App() {
     return getModelRoute(settings, modelKey).configured;
   }, [settings]);
 
+  const generateDraftComparison = useCallback(async () => {
+    const snapshot = workspaceRef.current;
+    const targets = (snapshot.stages.draft.generationTargets ?? []).filter((item) => {
+      const provider = settings.providers.find((candidate) => candidate.id === item.providerId);
+      return item.enabled !== false && provider?.configured && String(item.model ?? '').trim();
+    });
+    const uniqueTargets = [...new Map(targets.map((item) => [`${item.providerId}::${String(item.model).trim()}`, item])).values()];
+    if (uniqueTargets.length < 2) {
+      notify('请在正文写作页至少选择两个不同的已配置模型，再开始并行写作', 'warning');
+      return;
+    }
+    if (!hasConfirmedCurrentChapterContract(snapshot) || snapshot.stages.draft.chapterOutline?.status !== 'confirmed') {
+      notify('请先打磨并确认章节情节大纲，再进行多模型正文写作', 'warning');
+      return;
+    }
+    const startedAt = Date.now();
+    const generatingCandidates = uniqueTargets.map((target) => ({
+      id: `candidate-${target.id}-${Date.now()}`,
+      targetId: target.id,
+      providerId: target.providerId,
+      providerName: settings.providers.find((item) => item.id === target.providerId)?.name ?? '',
+      model: String(target.model).trim(),
+      status: 'generating',
+      suggestion: null,
+      error: null,
+      latencyMs: 0,
+      createdAt: new Date().toISOString(),
+    }));
+    const generatingSnapshot = {
+      ...snapshot,
+      stages: {
+        ...snapshot.stages,
+        draft: { ...snapshot.stages.draft, status: 'generating', candidates: generatingCandidates, error: null },
+      },
+    };
+    updateWorkspace(generatingSnapshot);
+    const persisted = await persistWorkspace(generatingSnapshot, false);
+    if (!persisted) {
+      updateWorkspace((current) => ({ ...current, stages: { ...current.stages, draft: { ...current.stages.draft, status: 'error', error: { message: '并行写作任务保存失败，尚未调用模型' } } } }));
+      return;
+    }
+    try {
+      const response = await generateDraftBatch({
+        workspace: generatingSnapshot,
+        input: getStageInput(generatingSnapshot, 'draft'),
+        context: buildGenerationContext(generatingSnapshot, 'draft'),
+        chapterId: snapshot.currentChapter?.number ?? 1,
+        targets: uniqueTargets,
+      });
+      const completedAt = new Date().toISOString();
+      const candidates = (response.results ?? []).map((result, index) => ({
+        id: generatingCandidates[index]?.id ?? `candidate-${index + 1}-${Date.now()}`,
+        targetId: result.targetId ?? uniqueTargets[index]?.id ?? '',
+        providerId: result.providerId ?? uniqueTargets[index]?.providerId ?? '',
+        providerName: result.providerName ?? settings.providers.find((item) => item.id === (result.providerId ?? uniqueTargets[index]?.providerId))?.name ?? '',
+        model: result.model ?? uniqueTargets[index]?.model ?? '',
+        status: result.ok ? 'ready' : 'error',
+        suggestion: result.ok ? extractSuggestion(result) : null,
+        error: result.ok ? null : { message: result.error?.message ?? '模型生成失败' },
+        latencyMs: result.latencyMs ?? 0,
+        createdAt: completedAt,
+      }));
+      const successful = candidates.filter((item) => item.status === 'ready');
+      const runs = (response.results ?? []).map((result) => result.run).filter(Boolean);
+      updateWorkspace((current) => ({
+        ...current,
+        stages: {
+          ...current.stages,
+          draft: {
+            ...current.stages.draft,
+            status: successful.length ? 'suggested' : 'error',
+            candidates,
+            selectedCandidateId: '',
+            error: successful.length ? null : { message: '所有模型都生成失败，请检查各渠道状态' },
+          },
+        },
+        runs: [...(current.runs ?? []), ...runs].slice(-30),
+      }));
+      notify(`并行写作完成：${successful.length}/${candidates.length} 个模型返回了正文，可在同一页面横向比较`, successful.length ? 'success' : 'error');
+    } catch (error) {
+      const message = toErrorMessage(error);
+      updateWorkspace((current) => ({ ...current, stages: { ...current.stages, draft: { ...current.stages.draft, status: 'error', error: { message, at: new Date().toISOString() } } } }));
+      notify(message, 'error');
+    }
+  }, [notify, persistWorkspace, settings, updateWorkspace]);
+
   const generateStage = useCallback(async (stageId, options = {}) => {
-    if (!isConfiguredForStage(stageId)) {
+    const hasParallelDraftTargets = stageId === 'draft' && (workspace.stages.draft.generationTargets ?? []).filter((item) => item.enabled !== false && item.providerId && String(item.model ?? '').trim()).length >= 2;
+    if (!isConfiguredForStage(stageId) && !hasParallelDraftTargets) {
       setSettingsOpen(true);
       notify(`请先补全 ${getStage(stageId).label} 的模型配置`, 'warning');
       return;
@@ -680,16 +1316,27 @@ export default function App() {
       notify(`请先确认第 ${workspace.currentChapter?.number ?? 1} 章章节契约；蓝图候选不会自动成为写作事实`, 'warning');
       return;
     }
-
-    const isIdeaRefinement = stageId === 'idea' && options.mode === 'iterate';
-    const isIdeaDraw = stageId === 'idea' && options.mode === 'draw';
-    const ideaArtifact = stageId === 'idea' ? workspace.stages.idea : null;
-    const feedback = isIdeaRefinement ? String(ideaArtifact?.refinementFeedback ?? '').trim() : '';
-    if (isIdeaRefinement && ideaArtifact?.suggestion == null) {
-      notify('当前没有可继续打磨的 Idea 工作稿', 'warning');
+    if (stageId === 'draft' && workspace.stages.draft.chapterOutline?.status !== 'confirmed') {
+      notify('请先生成、讨论并确认章节情节大纲，再生成正文', 'warning');
       return;
     }
-    if (isIdeaRefinement && !feedback) {
+    if (stageId === 'draft') {
+      await generateDraftComparison();
+      return;
+    }
+
+    const isIdeaRefinement = stageId === 'idea' && options.mode === 'iterate';
+    const isLogicRefinement = stageId === 'logic' && options.mode === 'iterate';
+    const isRefinement = isIdeaRefinement || isLogicRefinement;
+    const isIdeaDraw = stageId === 'idea' && options.mode === 'draw';
+    const ideaArtifact = stageId === 'idea' ? workspace.stages.idea : null;
+    const refinementArtifact = isIdeaRefinement ? ideaArtifact : isLogicRefinement ? workspace.stages.logic : null;
+    const feedback = isRefinement ? String(refinementArtifact?.refinementFeedback ?? '').trim() : '';
+    if (isRefinement && refinementArtifact?.suggestion == null) {
+      notify('当前没有可继续讨论的工作稿', 'warning');
+      return;
+    }
+    if (isRefinement && !feedback) {
       notify('先写清这一轮要保留、推翻或继续深挖什么', 'warning');
       return;
     }
@@ -703,13 +1350,21 @@ export default function App() {
             idea: { ...ideaArtifact, iterations: ideaHistory, refinementFeedback: feedback || ideaArtifact.refinementFeedback || '' },
           },
         }
-      : workspace;
-    const refinement = isIdeaRefinement
+      : isLogicRefinement
+        ? {
+            ...workspace,
+            stages: {
+              ...workspace.stages,
+              logic: { ...workspace.stages.logic, refinementFeedback: feedback },
+            },
+          }
+        : workspace;
+    const refinement = isRefinement
       ? {
           mode: 'iterate',
           feedback,
-          currentSuggestion: cloneValue(ideaArtifact.suggestion),
-          history: ideaHistory.slice(-6).map(compactIdeaIterationForPrompt),
+          currentSuggestion: cloneValue(refinementArtifact.suggestion),
+          history: isIdeaRefinement ? ideaHistory.slice(-6).map(compactIdeaIterationForPrompt) : [],
         }
       : null;
     const ideaDraw = isIdeaDraw ? {
@@ -746,6 +1401,7 @@ export default function App() {
     try {
       const response = await generateWithAI({
         stage: stageId,
+        writingMode: stageId === 'draft' ? 'draft' : null,
         workspace: snapshot,
         input: getStageInput(snapshot, stageId),
         context: buildGenerationContext(snapshot, stageId),
@@ -799,6 +1455,8 @@ export default function App() {
               suggestionAt: ideaIteration.createdAt,
               restoredFrom: null,
             } : {}),
+            ...(stageId === 'logic' ? { refinementFeedback: '' } : {}),
+            ...(stageId === 'draft' ? { paragraphAnnotations: [] } : {}),
             ...(stageId === 'review' ? { findings: findings ?? [] } : {}), error: null,
           },
         },
@@ -818,6 +1476,7 @@ export default function App() {
           [stageId]: {
             ...current.stages[stageId], status: 'error',
             ...(stageId === 'idea' ? { iterations: ideaHistory, refinementFeedback: feedback || current.stages.idea.refinementFeedback } : {}),
+            ...(stageId === 'logic' ? { refinementFeedback: feedback || current.stages.logic.refinementFeedback } : {}),
             error: { message, status: error instanceof ApiError ? error.status : 0, provider: getModelRoute(settings, getStage(stageId).modelKey).provider?.name || '未配置服务商', at: new Date().toISOString() },
           },
         },
@@ -825,7 +1484,7 @@ export default function App() {
       }));
       notify(message, 'error');
     }
-  }, [isConfiguredForStage, notify, persistWorkspace, settings, updateWorkspace, workspace]);
+  }, [generateDraftComparison, isConfiguredForStage, notify, persistWorkspace, settings, updateWorkspace, workspace]);
 
   const confirmSuggestion = useCallback((stageId) => {
     const artifact = workspace.stages[stageId];
@@ -834,9 +1493,20 @@ export default function App() {
       notify('当前没有可确认的建议稿或作者正文', 'warning');
       return;
     }
+    if (stageId === 'draft') {
+      const generationNotes = normalizeDraftGenerationNotes(artifact.generationNotes);
+      const draftChars = countChineseWords(getDraftBody(artifact.suggestion ?? artifact.text));
+      if (draftChars < generationNotes.minChars || draftChars > generationNotes.maxChars) {
+        notify(`当前正文约 ${draftChars} 字，需调整到 ${generationNotes.minChars}–${generationNotes.maxChars} 字后才能确认`, 'warning');
+        return;
+      }
+    }
     updateWorkspace((current) => {
       const currentArtifact = current.stages[stageId];
-      const confirmed = cloneValue(currentArtifact.suggestion ?? (stageId === 'draft' ? getDraftBody(currentArtifact.text) : null));
+      const confirmationSource = currentArtifact.suggestion ?? (stageId === 'draft' ? getDraftBody(currentArtifact.text) : null);
+      const confirmed = stageId === 'draft'
+        ? normalizeDraftSuggestionForLedger(confirmationSource, current.currentChapter)
+        : cloneValue(confirmationSource);
       const confirmedChanged = currentArtifact.confirmed != null && !sameJsonValue(currentArtifact.confirmed, confirmed);
       const findings = extractFindings({}, confirmed);
       const ideaIterations = stageId === 'idea' ? prepareIdeaIterations(currentArtifact) : null;
@@ -847,6 +1517,7 @@ export default function App() {
           [stageId]: {
             ...currentArtifact, status: 'ready', confirmed,
             ...(stageId === 'idea' ? { iterations: ideaIterations, refinementFeedback: '', restoredFrom: null } : {}),
+            ...(stageId === 'logic' ? { refinementFeedback: '' } : {}),
             ...(stageId === 'review' ? { findings: findings.length ? findings : currentArtifact.findings ?? [], accepted: true } : {}),
             confirmedAt: new Date().toISOString(), staleFrom: null,
           },
@@ -862,14 +1533,49 @@ export default function App() {
     updateWorkspace((current) => updateCurrentChapterContractCandidate(current, candidate));
   }, [updateWorkspace]);
 
+  const editCurrentChapterContract = useCallback(async () => {
+    if (chapterCycleBusyRef.current) return;
+    const snapshot = workspaceRef.current;
+    if (snapshot.currentChapter?.contract?.status !== 'confirmed') {
+      navigate('blueprint');
+      return;
+    }
+    const reopened = reopenCurrentChapterContract({ ...snapshot, currentStage: 'blueprint' });
+    if (!reopened) {
+      notify('当前没有可修改的已确认章节契约', 'warning');
+      return;
+    }
+    chapterCycleBusyRef.current = true;
+    setSaveState({ status: 'saving', message: '正在打开章节契约修订…' });
+    try {
+      const saved = await persistWorkspace(reopened, false);
+      if (!saved) {
+        notify('章节契约暂时无法进入修改状态，请恢复连接后重试', 'error');
+        return;
+      }
+      const persisted = { ...reopened, revision: serverRevisionRef.current };
+      workspaceRef.current = persisted;
+      setWorkspace(persisted);
+      setView('blueprint');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      notify('章节契约已进入修改状态；章末钩子可以直接清空', 'success');
+    } finally {
+      chapterCycleBusyRef.current = false;
+    }
+  }, [navigate, notify, persistWorkspace]);
+
   const confirmCurrentChapterContract = useCallback(async () => {
     if (chapterCycleBusyRef.current) return;
     const candidateWorkspace = workspaceRef.current;
-    const next = confirmCurrentChapterContractState(candidateWorkspace);
+    let next = confirmCurrentChapterContractState(candidateWorkspace);
     if (!next) {
       notify('请先补齐当前章的核心目标、冲突或章末钩子，再确认章节契约', 'warning');
       return;
     }
+    const revisionBase = latestContractRevision(candidateWorkspace.currentChapter?.contract);
+    const contractChanged = revisionBase != null
+      && !sameJsonValue(revisionBase, candidateWorkspace.currentChapter?.contract?.candidate);
+    if (contractChanged) next = invalidateChapterContractDownstream(next, candidateWorkspace.currentChapter?.contract?.candidate);
     chapterCycleBusyRef.current = true;
     setSaveState({ status: 'saving', message: '正在保存候选并确认章节契约…' });
     try {
@@ -886,7 +1592,9 @@ export default function App() {
       const persisted = { ...next, revision: serverRevisionRef.current };
       workspaceRef.current = persisted;
       setWorkspace(persisted);
-      notify(`第 ${next.currentChapter.number} 章契约已由你确认；现在可以进入章节写作`, 'success');
+      notify(contractChanged
+        ? `第 ${next.currentChapter.number} 章契约已重新确认；旧大纲和正文已标记为需要更新`
+        : `第 ${next.currentChapter.number} 章契约已由你确认；现在可以进入章节写作`, 'success');
     } finally {
       chapterCycleBusyRef.current = false;
     }
@@ -1217,11 +1925,23 @@ export default function App() {
       saveProjectCandidate();
       return;
     }
+    if (activeStageId === 'draft') {
+      const outline = workspace.stages.draft.chapterOutline ?? { status: 'empty' };
+      if (outline.status === 'generating') return;
+      if (outline.status === 'suggested') {
+        document.getElementById('chapter-outline-discussion')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return;
+      }
+      if (outline.status !== 'confirmed') {
+        generateChapterOutline('initial');
+        return;
+      }
+    }
     const status = activeArtifact.status;
     if (status === 'generating') return;
     if (status === 'suggested') {
-      if (activeStageId === 'idea') {
-        document.getElementById('idea-refinement')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (activeStageId === 'idea' || activeStageId === 'logic') {
+        document.getElementById(activeStageId === 'idea' ? 'idea-refinement' : 'logic-discussion')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
         return;
       }
       confirmSuggestion(activeStageId);
@@ -1246,13 +1966,20 @@ export default function App() {
       return;
     }
     generateStage(activeStageId);
-  }, [activeArtifact.status, activeStageId, completeCurrentChapter, confirmCurrentChapterContract, confirmSuggestion, establishProject, generateStage, navigate, notify, projectDashboard, saveProjectCandidate, view, workspace]);
+  }, [activeArtifact.status, activeStageId, completeCurrentChapter, confirmCurrentChapterContract, confirmSuggestion, establishProject, generateChapterOutline, generateStage, navigate, notify, projectDashboard, saveProjectCandidate, view, workspace]);
+
+  const handleSecondaryAction = useCallback(() => {
+    if (activeStageId === 'draft' && activeArtifact.status === 'suggested') {
+      if (workspace.stages.draft.chapterOutline?.status === 'confirmed') generateStage('draft');
+      else generateChapterOutline('initial');
+    }
+  }, [activeArtifact.status, activeStageId, generateChapterOutline, generateStage, workspace.stages.draft.chapterOutline?.status]);
 
   const primaryAction = projectDashboard && view === 'today'
     ? projectDashboard.chapter.contractReady
       ? { kicker: '唯一下一步', label: `开始写第 ${projectDashboard.chapter.number} 章`, hint: '先进入候选正文区；不会覆盖正式章节文件。', icon: 'check' }
       : { kicker: '写作前置', label: `先补第 ${projectDashboard.chapter.number} 章契约`, hint: '章节契约缺失时保持正式事实只读，不能直接进入正文生成。', icon: 'check' }
-    : getPrimaryAction({ view, workspace, stageId: activeStageId, configured: isConfiguredForStage(activeStageId) });
+    : getPrimaryAction({ view, workspace, stageId: activeStageId, configured: isConfiguredForStage(activeStageId), outlineConfigured: outlineReady });
 
   const ideaWorkshopActive = !projectDashboard && view === 'idea' && workspace.stages.idea.suggestion != null && workspace.stages.idea.status !== 'ready';
 
@@ -1430,7 +2157,7 @@ export default function App() {
             />
           ) : (
             <StageWorkspace
-              stageId={activeStageId} workspace={workspace} onProjectChange={editProject}
+              stageId={activeStageId} workspace={workspace} settings={settings} onProjectChange={editProject}
               onArtifactChange={(patch) => editArtifact(activeStageId, patch)}
               onSuggestionChange={(value) => updateSuggestion(activeStageId, value)}
               onIdeaDrawChange={updateIdeaDraw}
@@ -1441,11 +2168,36 @@ export default function App() {
               onIdeaRestore={restoreIdeaIteration}
               ideaConfigured={isConfiguredForStage('idea')}
               onIdeaSettings={() => setSettingsOpen(true)}
+              onLogicFeedbackChange={updateLogicFeedback}
+              onLogicRefine={() => generateStage('logic', { mode: 'iterate' })}
+              onLogicConfirm={() => confirmSuggestion('logic')}
+              logicConfigured={isConfiguredForStage('logic')}
+              onLogicSettings={() => setSettingsOpen(true)}
+              onDraftAnnotationsChange={updateDraftAnnotations}
+              onDraftParagraphRewrite={rewriteDraftParagraph}
+              onApplyDraftParagraphRewrite={applyDraftParagraphRewrite}
+              onDeleteDraftParagraph={deleteDraftParagraph}
+              onChapterOutlineFeedbackChange={updateChapterOutlineFeedback}
+              onChapterOutlineAnnotationsChange={updateChapterOutlineAnnotations}
+              onChapterOutlineRestore={restoreChapterOutlineIteration}
+              onChapterOutlineChange={updateChapterOutlineValue}
+              onDraftGenerationNotesChange={updateDraftGenerationNotes}
+              onDraftGenerationTargetsChange={updateDraftGenerationTargets}
+              onGenerateDraftComparison={generateDraftComparison}
+              onAdoptDraftCandidate={adoptDraftCandidate}
+              onChapterOutlineRefine={() => generateChapterOutline('iterate')}
+              onChapterOutlineGenerate={() => generateChapterOutline('initial')}
+              onChapterOutlineConfirm={confirmChapterOutline}
+              onConfirmDraft={() => confirmSuggestion('draft')}
+              outlineConfigured={outlineReady}
+              draftConfigured={isConfiguredForStage('draft')}
+              onDraftSettings={() => setSettingsOpen(true)}
               onCurrentChapterContractChange={changeCurrentChapterContract}
+              onEditCurrentChapterContract={editCurrentChapterContract}
               onConfirmCurrentChapterContract={confirmCurrentChapterContract}
             />
           )}
-          {(!projectDashboard || view === 'today') && !ideaWorkshopActive && <PrimaryActionDock action={primaryAction} onAction={handlePrimaryAction} saveState={saveState} />}
+          {(!projectDashboard || view === 'today') && !ideaWorkshopActive && activeStageId !== 'draft' && <PrimaryActionDock action={primaryAction} onAction={handlePrimaryAction} onSecondaryAction={handleSecondaryAction} saveState={saveState} />}
         </main>
         {projectDashboard && ['today', 'project-contract', 'project-chapter', 'model-lab', 'project-review', 'project-writeback'].includes(view) ? (
           <ProjectInspector dashboard={projectDashboard} open={inspectorOpen} onClose={() => setInspectorOpen(false)} />
@@ -1851,10 +2603,14 @@ function TodayWorkspace({ workspace, settings, onProjectChange, onIdeaChange }) 
 }
 
 function StageWorkspace({
-  stageId, workspace, onProjectChange, onArtifactChange, onSuggestionChange,
+  stageId, workspace, settings, onProjectChange, onArtifactChange, onSuggestionChange,
   onIdeaDrawChange, onIdeaDraw, onIdeaFeedbackChange, onIdeaRefine,
   onIdeaConfirm, onIdeaRestore, ideaConfigured, onIdeaSettings,
-  onCurrentChapterContractChange, onConfirmCurrentChapterContract,
+  onLogicFeedbackChange, onLogicRefine, onLogicConfirm, logicConfigured, onLogicSettings,
+  onDraftAnnotationsChange, onDraftParagraphRewrite, onApplyDraftParagraphRewrite, onDeleteDraftParagraph, outlineConfigured, draftConfigured, onDraftSettings,
+  onChapterOutlineFeedbackChange, onChapterOutlineAnnotationsChange, onChapterOutlineRestore, onChapterOutlineChange, onDraftGenerationNotesChange,
+  onDraftGenerationTargetsChange, onGenerateDraftComparison, onAdoptDraftCandidate, onChapterOutlineRefine, onChapterOutlineGenerate, onChapterOutlineConfirm, onConfirmDraft,
+  onCurrentChapterContractChange, onEditCurrentChapterContract, onConfirmCurrentChapterContract,
 }) {
   const artifact = workspace.stages[stageId];
   const copy = STAGE_COPY[stageId];
@@ -1865,7 +2621,7 @@ function StageWorkspace({
   const readerArtifact = readerValue == null ? artifact : { ...artifact, suggestion: readerValue };
   const readerReadOnly = artifact.status === 'ready' || artifact.suggestion == null;
   return (
-    <div className="content-column">
+    <div className={`content-column ${stageId === 'draft' ? 'draft-content-column' : ''}`}>
       <ContentHeader eyebrow={copy.eyebrow} title={copy.title} description={copy.description} status={artifact.status} />
       <StageNotice stageId={stageId} artifact={artifact} />
       {stageId === 'idea' && (
@@ -1893,7 +2649,16 @@ function StageWorkspace({
       {hasDedicatedReader && readerValue != null && (
         <>
           <ArtifactStatusStrip artifact={artifact} />
-          {stageId === 'logic' && <StoryEngineWorkshop artifact={readerArtifact} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
+          {stageId === 'logic' && <StoryEngineWorkshop
+            artifact={readerArtifact}
+            onSuggestionChange={onSuggestionChange}
+            onFeedbackChange={onLogicFeedbackChange}
+            onRefine={onLogicRefine}
+            onConfirm={onLogicConfirm}
+            configured={logicConfigured}
+            onSettings={onLogicSettings}
+            readOnly={readerReadOnly}
+          />}
           {stageId === 'blueprint' && <BlueprintWorkshop
             artifact={readerArtifact}
             onSuggestionChange={onSuggestionChange}
@@ -1902,12 +2667,68 @@ function StageWorkspace({
             chapterHistory={workspace.chapterHistory}
             chapterCycleEnabled={isChapterCycleWorkspace(workspace)}
             onCurrentChapterContractChange={onCurrentChapterContractChange}
+            onEditCurrentChapterContract={onEditCurrentChapterContract}
             onConfirmCurrentChapterContract={onConfirmCurrentChapterContract}
           />}
-          {stageId === 'draft' && <DraftWorkshop artifact={readerArtifact} workspace={workspace} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
+          {stageId === 'draft' && <DraftWorkshop
+            artifact={readerArtifact}
+            workspace={workspace}
+            settings={settings}
+            onSuggestionChange={onSuggestionChange}
+            onAnnotationsChange={onDraftAnnotationsChange}
+            onRewriteParagraph={onDraftParagraphRewrite}
+            onApplyRewrite={onApplyDraftParagraphRewrite}
+            onDeleteParagraph={onDeleteDraftParagraph}
+            onOutlineFeedbackChange={onChapterOutlineFeedbackChange}
+            onOutlineAnnotationsChange={onChapterOutlineAnnotationsChange}
+            onOutlineRestore={onChapterOutlineRestore}
+            onOutlineChange={onChapterOutlineChange}
+            onGenerationNotesChange={onDraftGenerationNotesChange}
+            onGenerationTargetsChange={onDraftGenerationTargetsChange}
+            onGenerateComparison={onGenerateDraftComparison}
+            onAdoptCandidate={onAdoptDraftCandidate}
+            onOutlineRefine={onChapterOutlineRefine}
+            onOutlineGenerate={onChapterOutlineGenerate}
+            onOutlineConfirm={onChapterOutlineConfirm}
+            onConfirmDraft={onConfirmDraft}
+            outlineConfigured={outlineConfigured}
+            configured={draftConfigured}
+            onSettings={onDraftSettings}
+            onEditChapterContract={onEditCurrentChapterContract}
+            readOnly={readerReadOnly}
+          />}
           {stageId === 'review' && <ReviewWorkshop artifact={readerArtifact} workspace={workspace} onSuggestionChange={onSuggestionChange} readOnly={readerReadOnly} />}
           {stageId === 'review' && canCompleteCurrentChapter(workspace) && <ChapterCompletionPanel currentChapter={workspace.currentChapter} />}
         </>
+      )}
+      {stageId === 'draft' && readerValue == null && (
+        <DraftWorkshop
+          artifact={readerArtifact}
+          workspace={workspace}
+          settings={settings}
+          onSuggestionChange={onSuggestionChange}
+          onAnnotationsChange={onDraftAnnotationsChange}
+          onRewriteParagraph={onDraftParagraphRewrite}
+          onApplyRewrite={onApplyDraftParagraphRewrite}
+          onDeleteParagraph={onDeleteDraftParagraph}
+          onOutlineFeedbackChange={onChapterOutlineFeedbackChange}
+          onOutlineAnnotationsChange={onChapterOutlineAnnotationsChange}
+          onOutlineRestore={onChapterOutlineRestore}
+          onOutlineChange={onChapterOutlineChange}
+          onGenerationNotesChange={onDraftGenerationNotesChange}
+          onGenerationTargetsChange={onDraftGenerationTargetsChange}
+          onGenerateComparison={onGenerateDraftComparison}
+          onAdoptCandidate={onAdoptDraftCandidate}
+          onOutlineRefine={onChapterOutlineRefine}
+          onOutlineGenerate={onChapterOutlineGenerate}
+          onOutlineConfirm={onChapterOutlineConfirm}
+          onConfirmDraft={onConfirmDraft}
+          outlineConfigured={outlineConfigured}
+          configured={draftConfigured}
+          onSettings={onDraftSettings}
+          onEditChapterContract={onEditCurrentChapterContract}
+          readOnly={false}
+        />
       )}
       {hasDedicatedReader && (
         <StageSourcePanel
@@ -2155,14 +2976,21 @@ function StatusBadge({ status }) {
   return <span className={`status-badge tone-${meta.tone}`}>{status === 'generating' ? <LoaderCircle size={13} className="spin" /> : status === 'ready' ? <Check size={13} /> : status === 'stale' || status === 'error' ? <AlertTriangle size={13} /> : <Circle size={9} />}{meta.label}</span>;
 }
 
-function PrimaryActionDock({ action, onAction, saveState }) {
+function PrimaryActionDock({ action, onAction, onSecondaryAction, saveState }) {
   return (
     <div className="primary-dock">
       <div className="primary-dock-copy"><span>{action.kicker}</span><p>{action.hint}</p></div>
-      <button type="button" className={`primary-button ${action.tone ?? ''}`} onClick={onAction} disabled={action.disabled}>
-        {action.loading ? <LoaderCircle size={18} className="spin" /> : action.icon === 'check' ? <Check size={18} /> : action.icon === 'settings' ? <Settings2 size={18} /> : action.icon === 'refresh' ? <RefreshCw size={18} /> : <Sparkles size={18} />}
-        <span>{action.label}</span>{!action.disabled && action.icon !== 'settings' && <ArrowRight size={17} />}
-      </button>
+      <div className="primary-dock-actions">
+        {action.secondaryLabel && (
+          <button type="button" className="secondary-button primary-dock-secondary" onClick={onSecondaryAction} disabled={action.loading || action.secondaryDisabled}>
+            <RefreshCw size={17} /><span>{action.secondaryLabel}</span>
+          </button>
+        )}
+        <button type="button" className={`primary-button ${action.tone ?? ''}`} onClick={onAction} disabled={action.disabled}>
+          {action.loading ? <LoaderCircle size={18} className="spin" /> : action.icon === 'check' ? <Check size={18} /> : action.icon === 'settings' ? <Settings2 size={18} /> : action.icon === 'refresh' ? <RefreshCw size={18} /> : <Sparkles size={18} />}
+          <span>{action.label}</span>{!action.disabled && action.icon !== 'settings' && <ArrowRight size={17} />}
+        </button>
+      </div>
       <div className={`dock-save-state save-${saveState.status}`}>{saveState.status === 'saving' ? <LoaderCircle size={12} className="spin" /> : <Circle size={8} />}{saveState.message}</div>
     </div>
   );
@@ -2226,6 +3054,7 @@ function SettingsDrawer({ initialSettings, onClose, onSaved, notify }) {
   const [showKeys, setShowKeys] = useState({});
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
   const [testResult, setTestResult] = useState(null);
   const activeProvider = form.providers.find((provider) => provider.id === activeProviderId) ?? form.providers[0] ?? null;
 
@@ -2247,6 +3076,7 @@ function SettingsDrawer({ initialSettings, onClose, onSaved, notify }) {
       type: provider.type || 'openai-compatible',
       kind: provider.kind || 'custom',
       baseUrl: provider.baseUrl.trim(),
+      models: Array.isArray(provider.models) ? provider.models : [],
       ...(provider.apiKey.trim() ? { apiKey: provider.apiKey.trim() } : {}),
     })),
     routes: Object.fromEntries(Object.entries(form.routes).map(([role, route]) => [role, {
@@ -2284,6 +3114,7 @@ function SettingsDrawer({ initialSettings, onClose, onSaved, notify }) {
       hasApiKey: false,
       apiKeyMasked: '',
       configured: false,
+      models: [],
     };
     setForm((current) => ({ ...current, providers: [...current.providers, provider] }));
     setActiveProviderId(id);
@@ -2330,6 +3161,21 @@ function SettingsDrawer({ initialSettings, onClose, onSaved, notify }) {
     } catch (error) { setTestResult({ ok: false, message: toErrorMessage(error) }); }
     finally { setTesting(false); }
   };
+  const handleDiscoverModels = async () => {
+    if (!activeProvider) return;
+    const providerError = validateProviders();
+    if (providerError) { setTestResult({ ok: false, message: providerError }); return; }
+    if (!activeProvider.baseUrl.trim()) { setTestResult({ ok: false, message: '请先填写当前渠道的 Base URL' }); return; }
+    if (!activeProvider.apiKey.trim() && !activeProvider.hasApiKey) { setTestResult({ ok: false, message: '请先填写当前渠道的 API Key' }); return; }
+    setDiscovering(true);
+    setTestResult(null);
+    try {
+      const response = await discoverProviderModels(payload(), activeProvider.id);
+      updateProvider(activeProvider.id, { models: response.models ?? [] });
+      setTestResult({ ok: true, message: `已从 ${response.providerName || activeProvider.name} 获取 ${response.count ?? response.models?.length ?? 0} 个模型` });
+    } catch (error) { setTestResult({ ok: false, message: toErrorMessage(error) }); }
+    finally { setDiscovering(false); }
+  };
 
   return (
     <div className="drawer-layer" role="dialog" aria-modal="true" aria-label="模型配置">
@@ -2369,12 +3215,18 @@ function SettingsDrawer({ initialSettings, onClose, onSaved, notify }) {
               <div className="provider-editor">
                 <div className="provider-editor-grid">
                   <Field label="渠道名称" required><input value={activeProvider.name} onChange={(event) => updateProvider(activeProvider.id, { name: event.target.value })} placeholder="例如：WuuuAPI / DeepSeek 官方 / 公司网关" /></Field>
-                  <Field label="接口协议"><select value={activeProvider.type} onChange={(event) => updateProvider(activeProvider.id, { type: event.target.value, kind: event.target.value === 'openai-compatible' ? activeProvider.kind : 'custom' })}><option value="openai-compatible">OpenAI Compatible</option><option value="anthropic-messages">Anthropic Messages</option><option value="gemini-generate-content">Gemini Generate Content</option></select></Field>
+                  <Field label="接口协议"><select value={activeProvider.type} onChange={(event) => updateProvider(activeProvider.id, { type: event.target.value, kind: event.target.value === 'openai-compatible' ? activeProvider.kind : 'custom', models: [] })}><option value="openai-compatible">OpenAI Compatible</option><option value="anthropic-messages">Anthropic Messages</option><option value="gemini-generate-content">Gemini Generate Content</option></select></Field>
                 </div>
-                <Field label="Base URL" hint="填写提供此 API Key 的同一家服务地址"><input value={activeProvider.baseUrl} onChange={(event) => updateProvider(activeProvider.id, { baseUrl: event.target.value })} placeholder="https://api.example.com/v1" spellCheck="false" /></Field>
+                <Field label="Base URL" hint="填写提供此 API Key 的同一家服务地址"><input value={activeProvider.baseUrl} onChange={(event) => updateProvider(activeProvider.id, { baseUrl: event.target.value, models: [] })} placeholder="https://api.example.com/v1" spellCheck="false" /></Field>
                 <Field label="渠道 API Key" hint={activeProvider.hasApiKey ? '已保存：' + (activeProvider.apiKeyMasked || '••••••••') + '。留空保留；必须与上方 Base URL 属于同一服务。' : '填写上方 Base URL 对应服务提供的密钥；模型品牌与密钥无关。'}>
                   <div className="secret-input"><KeyRound size={16} /><input type={showKeys[activeProvider.id] ? 'text' : 'password'} value={activeProvider.apiKey} onChange={(event) => updateProvider(activeProvider.id, { apiKey: event.target.value })} placeholder={activeProvider.hasApiKey ? '留空以保留现有密钥' : 'sk-…'} autoComplete="new-password" /><button type="button" onClick={() => setShowKeys((current) => ({ ...current, [activeProvider.id]: !current[activeProvider.id] }))} aria-label={showKeys[activeProvider.id] ? '隐藏密钥' : '显示密钥'}>{showKeys[activeProvider.id] ? <EyeOff size={16} /> : <Eye size={16} />}</button></div>
                 </Field>
+                <div className="model-discovery-row">
+                  <div><strong>渠道模型列表</strong><span>{activeProvider.models?.length ? `已获取 ${activeProvider.models.length} 个模型；保存后可用于所有阶段和并行写作。` : '填写地址和密钥后，从服务商的 /models 端点自动获取。'}</span></div>
+                  <button type="button" className="secondary-button" onClick={handleDiscoverModels} disabled={discovering || saving || testing}>
+                    <RefreshCw size={15} className={discovering ? 'spin' : ''} />{discovering ? '正在获取' : activeProvider.models?.length ? '重新获取' : '获取模型列表'}
+                  </button>
+                </div>
                 <div className="channel-guidance"><KeyRound size={16} /><span><strong>Key 跟着厂商实例走，不跟着模型名走。</strong>{activeProvider.kind === 'relay' ? '这里填写第三方中转服务发给你的 Key；Sol、Luna、Terra、DeepSeek 只是下方模型 ID。' : `这里填写 ${activeProvider.name} 自己签发的 Key，不要填其他厂商的密钥。`}</span></div>
               </div>
             )}
@@ -2384,6 +3236,8 @@ function SettingsDrawer({ initialSettings, onClose, onSaved, notify }) {
             <div className="model-route-list">
               {MODEL_ROWS.map((row) => {
                 const route = form.routes[row.key] ?? { providerId: form.providers[0]?.id ?? '', model: '' };
+                const routeProvider = form.providers.find((provider) => provider.id === route.providerId);
+                const routeModels = routeProvider?.models ?? [];
                 return (
                   <label key={row.key} className="model-route-row">
                     <span><strong>{row.label}</strong><small>{row.description}</small></span>
@@ -2391,7 +3245,13 @@ function SettingsDrawer({ initialSettings, onClose, onSaved, notify }) {
                       <select value={route.providerId} onChange={(event) => updateRoute(row.key, { providerId: event.target.value })} aria-label={row.label + ' API 渠道'}>
                         {form.providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name || '未命名渠道'}</option>)}
                       </select>
-                      <input value={route.model} onChange={(event) => updateRoute(row.key, { model: event.target.value })} placeholder="模型 ID" spellCheck="false" />
+                      {routeModels.length ? (
+                        <select value={route.model} onChange={(event) => updateRoute(row.key, { model: event.target.value })} aria-label={row.label + ' 模型'}>
+                          <option value="">选择模型</option>
+                          {route.model && !routeModels.includes(route.model) && <option value={route.model}>{route.model}（原配置）</option>}
+                          {routeModels.map((model) => <option value={model} key={model}>{model}</option>)}
+                        </select>
+                      ) : <input value={route.model} onChange={(event) => updateRoute(row.key, { model: event.target.value })} placeholder="模型 ID（可先在上方自动获取）" spellCheck="false" />}
                     </div>
                   </label>
                 );
@@ -2408,8 +3268,8 @@ function SettingsDrawer({ initialSettings, onClose, onSaved, notify }) {
           {testResult && <div className={'test-result ' + (testResult.ok ? 'success' : 'error')}>{testResult.ok ? <CheckCircle2 size={17} /> : <AlertCircle size={17} />}<span>{testResult.message}</span></div>}
         </div>
         <footer className="drawer-footer">
-          <button type="button" className="secondary-button" onClick={handleTest} disabled={testing || saving || !activeProvider}>{testing ? <LoaderCircle size={17} className="spin" /> : <PlugZap size={17} />}测试当前渠道</button>
-          <button type="button" className="primary-button drawer-save" onClick={handleSave} disabled={saving || testing}>{saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}保存配置</button>
+          <button type="button" className="secondary-button" onClick={handleTest} disabled={testing || saving || discovering || !activeProvider}>{testing ? <LoaderCircle size={17} className="spin" /> : <PlugZap size={17} />}测试当前渠道</button>
+          <button type="button" className="primary-button drawer-save" onClick={handleSave} disabled={saving || testing || discovering}>{saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}保存配置</button>
         </footer>
       </aside>
     </div>
@@ -2434,7 +3294,7 @@ function LoadingScreen() {
   return <div className="loading-screen"><div className="loading-brand"><span className="brand-mark"><BookOpenText size={22} /></span><div><strong>叙光</strong><span>Novel Studio</span></div></div><div className="loading-rule"><i /></div><p><LoaderCircle size={16} className="spin" />正在打开独立 Workspace…</p></div>;
 }
 
-function getPrimaryAction({ view, workspace, stageId, configured }) {
+function getPrimaryAction({ view, workspace, stageId, configured, outlineConfigured = false }) {
   if (view === 'today') {
     const hasIdeaContext = Boolean(
       String(workspace.stages.idea.input ?? '').trim()
@@ -2448,10 +3308,42 @@ function getPrimaryAction({ view, workspace, stageId, configured }) {
   }
   const stage = getStage(stageId);
   const status = workspace.stages[stageId].status;
+  if (stageId === 'draft') {
+    const outline = workspace.stages.draft.chapterOutline ?? { status: 'empty', suggestion: null, confirmed: null };
+    const generationNotes = normalizeDraftGenerationNotes(workspace.stages.draft.generationNotes);
+    if (outline.status === 'generating') {
+      return { kicker: '正在规划本章', label: '正在生成情节大纲', hint: '本轮只规划场景、冲突与字数分配，不会直接生成正文。', loading: true, disabled: true };
+    }
+    if (outline.status === 'suggested') {
+      return { kicker: '情节大纲待你裁决', label: '讨论或确认章节大纲', hint: `可以按反馈生成下一版；确认后才允许生成 ${generationNotes.minChars}–${generationNotes.maxChars} 字正文。`, icon: 'refresh' };
+    }
+    if (outline.status !== 'confirmed') {
+      if (!outlineConfigured) return { kicker: 'AI 动作已阻塞', label: '配置大纲模型后继续', hint: '为章节大纲单独选择 API 渠道和模型后再继续。', icon: 'settings', tone: 'blocked' };
+      return { kicker: '正文写作第一步', label: outline.status === 'error' ? '重试生成章节大纲' : '生成章节情节大纲', hint: `先用 3–5 个故事情节讲清本章会发生什么，再讨论确认；正文仍控制在 ${generationNotes.minChars}–${generationNotes.maxChars} 字。`, icon: outline.status === 'error' ? 'refresh' : 'sparkles' };
+    }
+  }
   if (status === 'generating') return { kicker: '\u6a21\u578b\u8fd0\u884c\u4e2d', label: '\u6b63\u5728\u5904\u7406', hint: '\u957f\u6587\u751f\u6210\u53ef\u80fd\u9700\u8981 1-5 \u5206\u949f\uff1b\u4f5c\u8005\u8f93\u5165\u4e0e\u5f53\u524d\u5efa\u8bae\u7a3f\u4f1a\u4e00\u76f4\u4fdd\u7559\u3002', loading: true, disabled: true };
+  if (status === 'suggested' && stageId === 'draft') {
+    const generationNotes = normalizeDraftGenerationNotes(workspace.stages.draft.generationNotes);
+    const actualChars = countChineseWords(getDraftBody(workspace.stages.draft.suggestion ?? workspace.stages.draft.text));
+    if (actualChars < generationNotes.minChars || actualChars > generationNotes.maxChars) {
+      return {
+        kicker: '字数门禁未通过',
+        label: '暂不能确认',
+        hint: `当前正文约 ${actualChars} 字，必须调整到 ${generationNotes.minChars}–${generationNotes.maxChars} 字；可以按新的情节篇幅分配全部重新生成。`,
+        icon: 'check',
+        tone: 'blocked',
+        disabled: true,
+        secondaryLabel: '全部重新生成',
+        secondaryDisabled: false,
+      };
+    }
+  }
   if (status === 'suggested') return stageId === 'idea'
     ? { kicker: 'Idea 仍在打磨', label: '继续打磨 Idea', hint: '填写本轮反馈，反复迭代到你愿意定稿；不会默认确认。', icon: 'refresh' }
-    : { kicker: '需要你的裁决', label: stageId === 'review' ? '采纳审查结论' : '确认采用建议稿', hint: '确认后写入作者账本并解锁下一阶段。', icon: 'check', tone: 'confirm' };
+    : stageId === 'logic'
+      ? { kicker: '故事情节待你裁决', label: '讨论或确认故事情节', hint: '可以按反馈生成下一版，也可以明确确认当前情节。', icon: 'refresh' }
+    : { kicker: '需要你的裁决', label: stageId === 'review' ? '采纳审查结论' : '确认采用建议稿', hint: stageId === 'draft' ? `正文必须在 ${normalizeDraftGenerationNotes(workspace.stages.draft.generationNotes).minChars}–${normalizeDraftGenerationNotes(workspace.stages.draft.generationNotes).maxChars} 字；可以确认当前整章，也可以按已确认大纲全部重新生成。` : '确认后写入作者账本并解锁下一阶段。', icon: 'check', tone: 'confirm', ...(stageId === 'draft' ? { secondaryLabel: '全部重新生成' } : {}) };
   if (status === 'ready') {
     if (stageId === 'blueprint' && isChapterCycleWorkspace(workspace) && !hasConfirmedCurrentChapterContract(workspace)) {
       const candidate = getCurrentChapterContractCandidate(workspace);
@@ -2473,7 +3365,11 @@ function getPrimaryAction({ view, workspace, stageId, configured }) {
   if (!configured) return { kicker: 'AI 动作已阻塞', label: '配置模型后继续', hint: '仍可编辑并自动保存；密钥只由服务端保管。', icon: 'settings', tone: 'blocked' };
   if (status === 'stale') return { kicker: '上游已变化', label: '基于最新上游重新生成', hint: '旧产物会保留到新建议确认之后。', icon: 'refresh', tone: 'stale' };
   if (status === 'error') return { kicker: '上次调用失败', label: `重试${stage.label}`, hint: '将使用当前输入和已保存模型配置重试。', icon: 'refresh' };
-  return { kicker: '唯一下一步', label: stageId === 'review' ? '运行章节审查' : stageId === 'draft' ? '生成章节正文候选' : `生成${stage.label}建议`, hint: '结果先进入独立建议稿，由你确认后才会成为事实。', icon: 'sparkles' };
+  if (stageId === 'draft') {
+    const generationNotes = normalizeDraftGenerationNotes(workspace.stages.draft.generationNotes);
+    return { kicker: '唯一下一步', label: '根据确认大纲生成正文', hint: `正文目标 ${generationNotes.targetChars} 字，允许区间 ${generationNotes.minChars}–${generationNotes.maxChars} 字；将同时执行你的风格备注。`, icon: 'sparkles' };
+  }
+  return { kicker: '唯一下一步', label: stageId === 'review' ? '运行章节审查' : `生成${stage.label}建议`, hint: '结果先进入独立建议稿，由你确认后才会成为事实。', icon: 'sparkles' };
 }
 
 function getTodayTaskDescription(stageId, status) {
@@ -2497,7 +3393,13 @@ function buildGenerationSignature(workspace, stageId) {
   return JSON.stringify({
     input: getStageInput(workspace, stageId),
     context: buildGenerationContext(workspace, stageId),
-    refinementFeedback: stageId === 'idea' ? workspace.stages.idea.refinementFeedback ?? '' : '',
+    confirmedChapterOutline: stageId === 'draft'
+      ? workspace.stages.draft.chapterOutline?.confirmed ?? null
+      : null,
+    draftGenerationNotes: stageId === 'draft'
+      ? normalizeDraftGenerationNotes(workspace.stages.draft.generationNotes)
+      : null,
+    refinementFeedback: ['idea', 'logic'].includes(stageId) ? workspace.stages[stageId].refinementFeedback ?? '' : '',
     ideaDraw: stageId === 'idea' ? workspace.stages.idea.draw ?? null : null,
   });
 }
@@ -2523,8 +3425,7 @@ function buildGenerationContext(workspace, stageId) {
   return { project: workspace.project, currentChapter: workspace.currentChapter, upstream };
 }
 
-function buildRun({ stageId, status, settings, startedAt, response, error }) {
-  const modelKey = getStage(stageId).modelKey;
+function buildRun({ stageId, modelKey = getStage(stageId).modelKey, status, settings, startedAt, response, error }) {
   const route = getModelRoute(settings, modelKey);
   return {
     id: response?.run?.id ?? response?.runId ?? `${stageId}-${Date.now()}`, stage: stageId, status,
@@ -2545,7 +3446,10 @@ function buildEntryConditions(workspace, settings, stageId) {
     const previous = STAGES[index - 1];
     conditions.push({ label: `${previous.label}已确认`, ok: workspace.stages[previous.id].status === 'ready' });
   } else conditions.push({ label: '可手写原始灵感或使用抽卡', ok: true });
-  if (stageId === 'draft') conditions.push({ label: '当前章契约已确认', ok: hasConfirmedCurrentChapterContract(workspace) });
+  if (stageId === 'draft') {
+    conditions.push({ label: '当前章契约已确认', ok: hasConfirmedCurrentChapterContract(workspace) });
+    conditions.push({ label: '章节大纲模型已配置', ok: getModelRoute(settings, 'outline').configured });
+  }
   if (stageId === 'review') conditions.push({ label: '章节正文可读取', ok: Boolean(getDraftBody(workspace.stages.draft.confirmed ?? workspace.stages.draft.text).trim()) });
   conditions.push({ label: `${getStage(stageId).label}模型已配置`, ok: route.configured });
   return conditions;
@@ -2556,6 +3460,12 @@ function buildRisks(workspace, settings, stageId) {
   const artifact = workspace.stages[stageId];
   const modelKey = getStage(stageId).modelKey;
   const route = getModelRoute(settings, modelKey);
+  if (stageId === 'draft') {
+    const outlineRoute = getModelRoute(settings, 'outline');
+    if (!outlineRoute.provider) risks.push({ label: '章节大纲尚未选择 API 渠道', tone: 'warning' });
+    else if (!outlineRoute.provider.baseUrl || !outlineRoute.provider.hasApiKey) risks.push({ label: `大纲渠道「${outlineRoute.provider.name}」的服务地址或 API Key 尚未配置`, tone: 'warning' });
+    else if (!outlineRoute.model) risks.push({ label: '章节大纲模型 ID 尚未填写', tone: 'warning' });
+  }
   if (!route.provider) risks.push({ label: `${getStage(stageId).label}尚未选择 API 渠道`, tone: 'warning' });
   else if (!route.provider.baseUrl || !route.provider.hasApiKey) risks.push({ label: `渠道「${route.provider.name}」的服务地址或 API Key 尚未配置`, tone: 'warning' });
   else if (!route.model) risks.push({ label: `${getStage(stageId).label}模型 ID 缺失`, tone: 'warning' });
@@ -2588,13 +3498,218 @@ function summarizeChapterContract(contract) {
   ].filter(Boolean).join(' · ') || valueToText(contract);
 }
 
+function latestContractRevision(contractState) {
+  const revisions = Array.isArray(contractState?.revisions) ? contractState.revisions : [];
+  return revisions.length ? revisions[revisions.length - 1]?.value ?? null : null;
+}
+
+function invalidateChapterContractDownstream(workspace, confirmedContract) {
+  const draft = workspace.stages.draft;
+  const outline = draft.chapterOutline ?? { status: 'empty', suggestion: null, confirmed: null, feedback: '' };
+  const outlineBase = outline.confirmed ?? outline.suggestion;
+  const hook = chapterContractEndHook(confirmedContract);
+  const nextOutline = outlineBase == null
+    ? null
+    : hook
+      ? cloneValue(outlineBase)
+      : clearChapterOutlineEnding(outlineBase);
+  const hasReviewArtifact = workspace.stages.review
+    && (workspace.stages.review.status !== 'empty'
+      || workspace.stages.review.suggestion != null
+      || workspace.stages.review.confirmed != null);
+  return {
+    ...workspace,
+    stages: {
+      ...workspace.stages,
+      draft: {
+        ...draft,
+        ...(draft.suggestion != null ? { status: 'stale', staleFrom: 'chapter-contract' } : {}),
+        ...(nextOutline != null ? {
+          chapterOutline: {
+            ...outline,
+            status: 'suggested',
+            suggestion: nextOutline,
+            feedback: hook ? '章节契约已修改，请根据新契约核对或重新生成本章情节。' : '章节契约已移除章末钩子，请核对当前收束后重新确认大纲。',
+            error: null,
+            updatedAt: new Date().toISOString(),
+          },
+        } : {}),
+      },
+      ...(hasReviewArtifact ? {
+        review: { ...workspace.stages.review, status: 'stale', staleFrom: 'chapter-contract', accepted: false },
+      } : {}),
+    },
+  };
+}
+
+function chapterContractEndHook(contract) {
+  if (!contract || typeof contract !== 'object' || Array.isArray(contract)) return '';
+  return String(contract.chapterEndHook ?? contract.endHook ?? contract.hook ?? '').trim();
+}
+
+function clearChapterOutlineEnding(value) {
+  const parsed = tryParseJson(value);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return cloneValue(value);
+  const next = { ...cloneValue(parsed), ending: '' };
+  for (const key of ['endingHook', 'chapterEndHook', 'endHook']) {
+    if (Object.prototype.hasOwnProperty.call(next, key)) next[key] = '';
+  }
+  return next;
+}
+
 function getDraftBody(value) {
   const parsed = tryParseJson(value);
-  if (typeof parsed === 'string') return parsed;
+  if (typeof parsed === 'string') return recoverDraftBodyFromMalformedJson(parsed) ?? parsed;
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     return valueToText(parsed.draft ?? parsed.content ?? parsed.text ?? parsed.manuscript ?? parsed);
   }
   return valueToText(parsed);
+}
+
+function recoverDraftBodyFromMalformedJson(value) {
+  const raw = String(value ?? '').trim();
+  const marker = /"draft"\s*:\s*"/i.exec(raw);
+  if (!marker) return null;
+  const start = marker.index + marker[0].length;
+  const endings = ['","contractWarnings"', '","openIssues"', '","warnings"']
+    .map((candidate) => raw.lastIndexOf(candidate))
+    .filter((index) => index >= start);
+  const end = endings.length ? Math.min(...endings) : raw.length;
+  const draft = raw.slice(start, end)
+    .replace(/\s*```\s*$/i, '')
+    .replace(/"\s*}\s*$/, '')
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t')
+    .replace(/\\\//g, '/')
+    .replace(/\\\\/g, '\\')
+    .replace(/"([^"\n]+)"/g, '“$1”')
+    .trim();
+  return draft || null;
+}
+
+function normalizeDraftSuggestionForLedger(value, currentChapter) {
+  if (typeof value !== 'string') return cloneValue(value);
+  const draft = recoverDraftBodyFromMalformedJson(value);
+  if (!draft) return value;
+  const field = (name) => new RegExp(`"${name}"\\s*:\\s*"([^"\\r\\n]*)"`, 'i').exec(value)?.[1]?.trim() ?? '';
+  return {
+    chapterId: field('chapterId') || `CHAPTER ${String(currentChapter?.number ?? 1).padStart(2, '0')}`,
+    title: field('title') || currentChapter?.title || '',
+    draft,
+    contractWarnings: [
+      '模型返回的 JSON 格式损坏，叙光已提取可读正文；确认账本中不会保存 JSON 外壳和转义符。',
+      '原始响应可能在结尾被截断，请确认最后一段完整后再进入审查。',
+    ],
+    openIssues: ['检查正文结尾是否完整。'],
+    recoveredFromMalformedJson: true,
+  };
+}
+
+function splitDraftParagraphs(value) {
+  return String(value ?? '').trim().split(/\r?\n\s*\r?\n+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function updateDraftAnnotation(items, annotationId, updater) {
+  return (Array.isArray(items) ? items : []).map((item) => item.id === annotationId ? updater(item) : item);
+}
+
+function updateDraftAnnotationInWorkspace(workspace, annotationId, updater) {
+  return {
+    ...workspace,
+    stages: {
+      ...workspace.stages,
+      draft: {
+        ...workspace.stages.draft,
+        paragraphAnnotations: updateDraftAnnotation(workspace.stages.draft.paragraphAnnotations, annotationId, updater),
+      },
+    },
+  };
+}
+
+function updateChapterOutlineInWorkspace(workspace, updater) {
+  const currentOutline = workspace.stages.draft.chapterOutline ?? {
+    status: 'empty', suggestion: null, confirmed: null, feedback: '', error: null,
+  };
+  return {
+    ...workspace,
+    stages: {
+      ...workspace.stages,
+      draft: {
+        ...workspace.stages.draft,
+        chapterOutline: updater(currentOutline),
+      },
+    },
+  };
+}
+
+function extractParagraphRewrite(response) {
+  const suggestion = extractSuggestion(response);
+  const replacementParagraph = typeof suggestion === 'string'
+    ? suggestion.trim()
+    : String(suggestion?.replacementParagraph ?? suggestion?.replacement ?? suggestion?.paragraph ?? '').trim();
+  if (!replacementParagraph) throw new Error('模型没有返回可用的段落重写正文');
+  return {
+    replacementParagraph: replacementParagraph.replace(/\r?\n\s*\r?\n+/g, '\n'),
+    changeSummary: typeof suggestion === 'object' ? String(suggestion?.changeSummary ?? '').trim() : '',
+    continuityWarnings: Array.isArray(suggestion?.continuityWarnings) ? suggestion.continuityWarnings.slice(0, 20) : [],
+  };
+}
+
+function replaceSuggestionParagraph(suggestion, paragraphIndex, expectedText, replacementText) {
+  const source = getDraftBody(suggestion);
+  const replaced = replaceDraftParagraph(source, paragraphIndex, expectedText, replacementText);
+  if (replaced == null) return null;
+  if (typeof suggestion === 'string') return replaced;
+  if (!suggestion || typeof suggestion !== 'object' || Array.isArray(suggestion)) return null;
+  const field = ['draft', 'content', 'text', 'manuscript'].find((key) => Object.prototype.hasOwnProperty.call(suggestion, key)) ?? 'draft';
+  return { ...suggestion, [field]: replaced };
+}
+
+function deleteSuggestionParagraph(suggestion, paragraphIndex, expectedText, currentChapter) {
+  const source = getDraftBody(suggestion);
+  const deleted = deleteDraftParagraphText(source, paragraphIndex, expectedText);
+  if (deleted == null) return null;
+  if (typeof suggestion === 'string') {
+    const recovered = recoverDraftBodyFromMalformedJson(suggestion);
+    if (recovered != null) {
+      const normalized = normalizeDraftSuggestionForLedger(suggestion, currentChapter);
+      return normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+        ? { ...normalized, draft: deleted }
+        : deleted;
+    }
+    return deleted;
+  }
+  if (!suggestion || typeof suggestion !== 'object' || Array.isArray(suggestion)) return null;
+  const field = ['draft', 'content', 'text', 'manuscript'].find((key) => Object.prototype.hasOwnProperty.call(suggestion, key)) ?? 'draft';
+  return { ...suggestion, [field]: deleted };
+}
+
+function deleteDraftParagraphText(source, paragraphIndex, expectedText) {
+  const paragraphs = splitDraftParagraphs(source);
+  if (!Number.isInteger(paragraphIndex) || paragraphIndex < 0 || paragraphIndex >= paragraphs.length) return null;
+  if (paragraphs[paragraphIndex] !== String(expectedText ?? '').trim()) return null;
+  paragraphs.splice(paragraphIndex, 1);
+  return paragraphs.join('\n\n');
+}
+
+function replaceDraftParagraph(source, paragraphIndex, expectedText, replacementText) {
+  const pieces = String(source ?? '').split(/(\r?\n\s*\r?\n+)/);
+  let currentIndex = 0;
+  for (let index = 0; index < pieces.length; index += 2) {
+    const piece = pieces[index];
+    const trimmed = piece.trim();
+    if (!trimmed) continue;
+    if (currentIndex === paragraphIndex) {
+      if (trimmed !== String(expectedText ?? '').trim()) return null;
+      const leading = piece.match(/^\s*/)?.[0] ?? '';
+      const trailing = piece.match(/\s*$/)?.[0] ?? '';
+      pieces[index] = `${leading}${String(replacementText ?? '').trim()}${trailing}`;
+      return pieces.join('');
+    }
+    currentIndex += 1;
+  }
+  return null;
 }
 
 function toErrorMessage(error) {
@@ -2612,6 +3727,36 @@ function formatDateTime(value) {
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
 }
 function countChineseWords(text) { return String(text ?? '').replace(/\s+/g, '').length; }
+
+function normalizeDraftGenerationNotes(value) {
+  const incoming = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const minChars = Math.min(10000, Math.max(500, Number.parseInt(incoming.minChars, 10) || 2000));
+  const maxChars = Math.min(12000, Math.max(minChars + 200, Number.parseInt(incoming.maxChars, 10) || 3000));
+  const requestedTarget = Number.parseInt(incoming.targetChars, 10);
+  return {
+    minChars,
+    targetChars: Number.isFinite(requestedTarget)
+      ? Math.min(maxChars, Math.max(minChars, requestedTarget))
+      : Math.round((minChars + maxChars) / 2),
+    maxChars,
+    style: String(incoming.style ?? '').slice(0, 6000),
+    sectionInstructions: normalizeSectionInstructions(incoming.sectionInstructions),
+  };
+}
+function normalizeSectionInstructions(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).slice(0, 40).map(([key, item]) => {
+    const incoming = item && typeof item === 'object' && !Array.isArray(item) ? item : { instruction: item };
+    return [String(key).slice(0, 120), {
+      title: String(incoming.title ?? '').slice(0, 200),
+      instruction: String(incoming.instruction ?? '').slice(0, 2000),
+      lengthMode: normalizeSectionLengthMode(incoming.lengthMode),
+    }];
+  }));
+}
+function normalizeSectionLengthMode(value) {
+  return ['short', 'normal', 'long', 'focus'].includes(value) ? value : 'normal';
+}
 function sanitizeFilename(value) { return value.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-').slice(0, 80); }
 function prepareIdeaIterations(artifact) {
   const history = Array.isArray(artifact?.iterations) ? artifact.iterations.map((item) => cloneValue(item)) : [];

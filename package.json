@@ -28,7 +28,7 @@
     "audit:checkpoints": "node server/checkpoint-audit.mjs",
     "test:writeback": "node server/writeback.smoke.mjs",
     "test:contract": "node server/contract-writeback.smoke.mjs",
-    "test:generation": "node server/chapter-generation.smoke.mjs",
+    "test:generation": "node server/chapter-generation.smoke.mjs && node server/draft-length-plan.smoke.mjs",
     "test:canon": "node server/canon-revision.smoke.mjs",
     "test:runs": "node server/run-ledger.smoke.mjs",
     "test:benchmark": "node server/benchmark-harness.smoke.mjs",

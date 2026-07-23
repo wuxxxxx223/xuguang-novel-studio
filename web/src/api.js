@@ -179,7 +179,14 @@ export function testModelConnection(settings, options = {}) {
   });
 }
 
-export function generateWithAI({ stage, workspace, input, context, refinement = null, ideation = null, chapterId = null }) {
+export function discoverProviderModels(settings, providerId) {
+  return request('/api/models/discover', {
+    method: 'POST',
+    body: JSON.stringify({ settings, providerId }),
+  });
+}
+
+export function generateWithAI({ stage, workspace, input, context, refinement = null, ideation = null, writingMode = null, chapterId = null }) {
   return request('/api/ai/generate', {
     method: 'POST',
     body: JSON.stringify({
@@ -189,8 +196,15 @@ export function generateWithAI({ stage, workspace, input, context, refinement = 
       context,
       ...(refinement ? { refinement } : {}),
       ...(ideation ? { ideation } : {}),
+      ...(writingMode ? { writingMode } : {}),
       ...(chapterId != null ? { chapterId } : {}),
     }),
   });
 }
 
+export function generateDraftBatch({ workspace, input, context, chapterId, targets }) {
+  return request('/api/ai/generate-batch', {
+    method: 'POST',
+    body: JSON.stringify({ stage: 'draft', writingMode: 'draft', workspace, input, context, chapterId, targets }),
+  });
+}

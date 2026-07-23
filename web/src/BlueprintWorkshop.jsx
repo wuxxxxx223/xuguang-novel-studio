@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import {
   BookOpenText, Check, CheckCircle2, ChevronDown, CircleHelp, Flag, GitBranch, ListChecks,
-  Network, PanelsTopLeft, Sparkles, Target, UsersRound,
+  Network, PanelsTopLeft, PenLine, Sparkles, Target, Trash2, UsersRound,
 } from 'lucide-react';
 import { tryParseJson } from './state.js';
 import {
@@ -20,7 +20,7 @@ const SECTION_DEFINITIONS = [
 export default function BlueprintWorkshop({
   artifact, onSuggestionChange, readOnly = false,
   currentChapter = null, chapterHistory = [], chapterCycleEnabled = false,
-  onCurrentChapterContractChange, onConfirmCurrentChapterContract,
+  onCurrentChapterContractChange, onEditCurrentChapterContract, onConfirmCurrentChapterContract,
 }) {
   const [viewMode, setViewMode] = useState('read');
   const [expandedSections, setExpandedSections] = useState(() => new Set(['contract']));
@@ -194,14 +194,24 @@ export default function BlueprintWorkshop({
                 ? <ChapterContract contract={currentContractValue} />
                 : <ReadableValue value={currentContractValue} />}
               {!currentContractConfirmed && (
-                <details className="workspace-chapter-contract-editor">
+                <details className="workspace-chapter-contract-editor" defaultOpen>
                   <summary>核对或编辑第 {currentChapter?.number ?? 1} 章契约<ChevronDown size={15} /></summary>
                   <p>这里的修改仍是待确认草稿，不会改写已确认蓝图，也不会进入正式正文项目。</p>
-                  <StructuredArtifactEditor
-                    value={currentContractValue}
-                    onChange={(value) => onCurrentChapterContractChange?.(value)}
-                    disabled={busy || !onCurrentChapterContractChange}
-                  />
+                  {typeof currentContractValue === 'object' && !Array.isArray(currentContractValue) && (
+                    <ChapterContractHookEditor
+                      contract={currentContractValue}
+                      onChange={onCurrentChapterContractChange}
+                      disabled={busy || !onCurrentChapterContractChange}
+                    />
+                  )}
+                  <details className="workspace-chapter-contract-advanced">
+                    <summary>高级：编辑完整章节契约<ChevronDown size={14} /></summary>
+                    <StructuredArtifactEditor
+                      value={currentContractValue}
+                      onChange={(value) => onCurrentChapterContractChange?.(value)}
+                      disabled={busy || !onCurrentChapterContractChange}
+                    />
+                  </details>
                 </details>
               )}
             </div>
@@ -216,6 +226,14 @@ export default function BlueprintWorkshop({
                 disabled={busy || !currentContractValue || !onConfirmCurrentChapterContract}
               >
                 <Check size={17} />确认作为第 {currentChapter?.number ?? 1} 章契约
+              </button>
+            </div>
+          )}
+          {currentContractConfirmed && (
+            <div className="workspace-chapter-contract-actions revision-action">
+              <div><PenLine size={15} /><span>不满意章末钩子或其他约束时，可以重新打开当前章契约修改。</span></div>
+              <button type="button" className="secondary-button" onClick={onEditCurrentChapterContract} disabled={busy || !onEditCurrentChapterContract}>
+                <PenLine size={16} />修改当前章契约
               </button>
             </div>
           )}
@@ -399,6 +417,37 @@ function ChapterContract({ contract }) {
         </div>
       )}
     </div>
+  );
+}
+
+function ChapterContractHookEditor({ contract, onChange, disabled }) {
+  const hook = String(contract?.chapterEndHook ?? contract?.endHook ?? contract?.hook ?? '');
+  const updateHook = (value) => {
+    const next = { ...contract, chapterEndHook: value };
+    delete next.endHook;
+    delete next.hook;
+    onChange?.(next);
+  };
+  return (
+    <section className="chapter-contract-hook-editor">
+      <div>
+        <label htmlFor="current-chapter-end-hook">章末钩子（可留空）</label>
+        <small>不想设置悬念或强钩子时，直接清空。正文会采用自然收束，不再强制制造悬念。</small>
+      </div>
+      <textarea
+        id="current-chapter-end-hook"
+        rows={3}
+        value={hook}
+        onChange={(event) => updateHook(event.target.value)}
+        disabled={disabled}
+        placeholder="留空表示本章不要求章末钩子"
+      />
+      {hook.trim() && (
+        <button type="button" className="chapter-contract-clear-hook" onClick={() => updateHook('')} disabled={disabled}>
+          <Trash2 size={14} />清空章末钩子
+        </button>
+      )}
+    </section>
   );
 }
 
